@@ -1,0 +1,89 @@
+# AegisCPG — repository ignore rules
+# Author: Pratham Kapoor <prathamkapoor027@gmail.com>
+# https://github.com/PrathamKapoor
+#
+# Hard Rule 1 (strict directory containment) requires that the portable
+# toolchain bootstrap, all virtual environments, and every build artifact
+# live *inside* this repository. They are therefore explicitly ignored so
+# they never reach the object store, while the directories themselves stay
+# inside C:\Pratham\AegisCPG as mandated.
+
+# --- Portable toolchain bootstrap (Rust, Python, Git) -----------------------
+/.toolchain/
+
+# --- Rust build artifacts ---------------------------------------------------
+/target/
+**/target/
+**/*.rs.bk
+Cargo.lock.orig
+
+# --- Python virtual environments -------------------------------------------
+/.venv/
+/.python/
+.venv/
+venv/
+env/
+/ml-rag-engine/.venv/
+
+# --- Python byte-code / build caches ---------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Embedded build objects (eBPF + native helpers) -------------------------
+*.o
+*.bpf.o
+*.ko
+*.a
+*.lib
+*.obj
+*.dll
+*.exe
+
+# --- Node / Next.js ---------------------------------------------------------
+/node_modules/
+**/node_modules/
+/apps/web-portal/node_modules/
+/apps/web-portal/.next/
+/apps/web-portal/out/
+/apps/web-portal/.turbo/
+/apps/web-portal/next-env.d.ts
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# --- ML model artifacts -----------------------------------------------------
+# Trained ONNX graphs and weight matrices are *build outputs* of
+# ml-rag-engine and are regenerated deterministically by
+# `python ml-rag-engine/scripts/train_models.py`.
+/ml-rag-engine/artifacts/
+*.onnx
+*.ort
+*.npz
+*.pkl
+*.joblib
+
+# --- Local databases (regenerable; benchmarks/results/*.duckdb is ignored) --
+*.duckdb
+*.duckdb.wal
+*.sqlite
+*.sqlite3
+*.db
+/tmp/
+
+# --- OS / editor noise ------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+.vs/
+.vscode/
+.idea/
+*.swp
+*~
