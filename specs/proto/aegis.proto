@@ -1,0 +1,284 @@
+// ============================================================================
+// AegisCPG -- gRPC control-plane contract
+//
+// Author: Pratham Kapoor <prathamkapoor027@gmail.com>
+// https://github.com/PrathamKapoor
+//
+// WHAT:  The AegisControlPlane service that links the three non-Python
+//        components to the ML/RAG engine:
+//          * crates/aegis-proxy-gateway  (Rust, Axum/Tokio, every OS)
+//          * crates/aegis-ebpf-loader   (Rust, Linux kernel host)
+//          * ml-rag-engine               (Python, Stage 2 + MILP synthesis)
+//
+// WHY:   Stage 2 (GAT + GBDT semantic divergence) and Stage 3's MILP live in
+//        Python, while the enforcement hot path lives in Rust. Without a typed
+//        contract between them, the two halves drift: a Python model adds a
+//        feature, the Rust gateway keeps reading the old struct, and the
+//        divergence score silently stops being enforced. Proto3 makes that
+//        class of drift a compile error.
+//
+//        The kernel telemetry stream is server-streaming because eBPF ringbuf
+//        events arrive continuously and the portal needs them live; a unary
+//        poll would either lose events or add latency.
+//
+// HOW:   Codegen is expected as:
+//          protoc --proto_path=specs/proto \
+//                 --rust_out=crates/aegis-common/src/generated \
+//                 --python_out=ml-rag-engine/aegis_ml/generated specs/proto/aegis.proto
+//        The generated modules are build artefacts and are git-ignored; this
+//        .proto is the source of truth.
+// ============================================================================
+
+syntax = "proto3";
+
+package aegis.v1;
+
+// ---------------------------------------------------------------------------
+// Denning security lattice, mirroring crates/aegis-common/src/lattice.rs.
+// ---------------------------------------------------------------------------
+enum SecurityLattice {
+  LATTICE_UNSPECIFIED = 0;
+  PUBLIC = 1;           // lattice level 0, the bottom element
+  INTERNAL = 2;         // lattice level 1
+  CONFIDENTIAL = 3;     // lattice level 2
+  SECRET = 4;           // lattice level 3, the top element
+}
+
+// ---------------------------------------------------------------------------
+// Sink taxonomy, mirroring aegis_common::types::SinkKind.
+// ---------------------------------------------------------------------------
+enum SinkKind {
+  SINK_KIND_UNSPECIFIED = 0;
+  FILE_READ = 1;
+  FILE_WRITE = 2;
+  COMMAND_EXEC = 3;
+  NETWORK_OUTBOUND = 4;
+  NETWORK_INBOUND = 5;
+  ENV_ACCESS = 6;
+  // Statically unresolvable dynamic dispatch (eval, new Function, getattr,
+  // __import__). Triggers the ADR-005 fail-closed contract: the resulting
+  // TACR carries neither an exec allowlist nor a net CIDR list.
+  UNBOUNDED_DYNAMIC = 7;
+}
+
+// ---------------------------------------------------------------------------
+// Compressed Data Transformation Graph.
+// ---------------------------------------------------------------------------
+enum DtgNodeType {
+  DTG_NODE_TYPE_UNSPECIFIED = 0;
+  TOOL_INPUT_PARAM = 1;
+  LOCAL_BUFFER = 2;
+  ENV_SECRET = 3;
+  FILE_HANDLE = 4;
+  NETWORK_SOCKET = 5;
+  PROCESS_SINK = 6;
+  RETURN_PAYLOAD = 7;
+}
+
+message DtgNode {
+  string id = 1;
+  string label = 2;
+  DtgNodeType node_type = 3;
+  SecurityLattice lattice = 4;
+  string file_path = 5;
+  uint32 line = 6;
+}
+
+message DtgEdge {
+  string source = 1;
+  string target = 2;
+  // The transforming function. Edges are functions and nodes are data states;
+  // this inverted topology is what compresses the CPG by ~87%.
+  string transform_fn = 3;
+  SinkKind sink_kind = 4;
+  // 0..3, bounded by MAX_HOP_DEPTH.
+  uint32 hop_depth = 5;
+}
+
+message DetectedSink {
+  SinkKind sink_kind = 1;
+  string file_path = 2;
+  uint32 line = 3;
+  string function = 4;
+  uint32 hop_depth = 5;
+}
+
+message CompressedDtg {
+  string server_id = 1;
+  string language = 2;
+  uint64 raw_cpg_node_count = 3;
+  uint64 compressed_node_count = 4;
+  repeated DtgNode nodes = 5;
+  repeated DtgEdge edges = 6;
+  repeated DetectedSink detected_sinks = 7;
+  // SHA-256 over the JCS-canonicalised graph, sorted by id / (source,target,
+  // transform_fn) / (file_path,line,sink_kind) so the hash is invariant under
+  // parser emission order. This is the H(DTG) half of Property 1.
+  string dtg_sha256 = 8;
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2: semantic divergence scoring (ADR-009).
+// ---------------------------------------------------------------------------
+
+message DivergenceRequest {
+  string tool_id = 1;
+  string server_id = 2;
+  // The tool's declared description. Attacker-controlled, therefore never
+  // interpreted as an instruction anywhere in AegisCPG (ADR-001).
+  string declared_description = 3;
+  // The tool's 3-hop DTG neighbourhood.
+  CompressedDtg dtg = 4;
+  // Capability set implied by the declared description.
+  repeated string declared_capabilities = 5;
+  // Set to true only when the onnxruntime graph is resident. When false the
+  // server MUST NOT fabricate a score; it returns score_availability false.
+  bool model_loaded = 6;
+}
+
+message DivergenceResponse {
+  bool score_availability = 1;
+  // In [0,1]. Scores >= 0.50 make every reached sink ineligible for a MILP
+  // grant (hard constraint x_c = 0).
+  double semantic_divergence_score = 2;
+  double gat_score = 3;
+  double gbdt_score = 4;
+  double description_cosine_distance = 5;
+  double capability_iou = 6;
+  double shannon_entropy = 7;
+  uint32 cyclomatic_complexity = 8;
+  repeated SinkKind reached_sinks = 9;
+  // Wall-clock cost of the single onnxruntime Session::run.
+  double inference_ms = 10;
+  // Digest of the model artefact, so a stale gateway cannot silently trust a
+  // model trained against a different DTG node-type schema version.
+  string model_sha256 = 11;
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3: MILP least-privilege synthesis + signed TACR emission.
+// ---------------------------------------------------------------------------
+
+message PolicySynthesisRequest {
+  string tool_id = 1;
+  string server_id = 2;
+  CompressedDtg dtg = 3;
+  // Benign task requirements, derived from surviving benign DTG code paths and
+  // NEVER from the attacker-controlled description (ADR-007).
+  repeated string benign_requirements = 4;
+  // Capabilities excluded by the divergence model or by a Z3 counterexample.
+  repeated SinkKind forbidden_capabilities = 5;
+  // CVSS-derived risk weight per candidate capability.
+  map<string, double> risk_weights = 6;
+  uint32 ttl_seconds = 7;
+  // Hex-encoded ES256 public key the returned signature must verify under.
+  string signing_public_key_hex = 8;
+}
+
+message TacrContractProto {
+  // The full TACR body, serialised as canonical JSON conforming to
+  // specs/tacr.schema.json. Kept as a single opaque field so the Rust and
+  // Python serialisers cannot drift: there is exactly one wire format, and it
+  // is the schema on disk.
+  bytes canonical_json = 1;
+  string tacr_sha256 = 2;
+  string ecdsa_p256_signature = 3;
+  // Optimisation report from the MILP.
+  double objective_value = 4;
+  uint32 capabilities_denied = 5;
+  double attack_surface_eliminated_pct = 6;
+  double solve_time_ms = 7;
+  // "highs" | "ortools" | "none"
+  string solver = 8;
+}
+
+// ---------------------------------------------------------------------------
+// Stage 4: in-kernel telemetry.
+// ---------------------------------------------------------------------------
+
+message TelemetrySubscription {
+  // Empty means every hook. Values: 1 bprm_check_security, 2 file_open,
+  // 3 socket_connect.
+  repeated uint32 hook_types = 1;
+  // Restrict to these cgroups. Empty means every registered cgroup.
+  repeated uint64 cgroup_ids = 2;
+  // Drop events whose latency exceeds this, to keep the portal responsive under
+  // flood. 0 means no filtering.
+  uint64 max_latency_us = 3;
+}
+
+message KernelAuditEventProto {
+  uint64 timestamp_ns = 1;
+  uint64 cgroup_id = 2;
+  uint32 pid = 3;
+  uint32 uid = 4;
+  // 1 bprm_check_security, 2 file_open, 3 socket_connect.
+  uint32 hook_type = 5;
+  // 0 = ALLOW, negative errno = DENY (-1 = -EPERM).
+  int32 verdict = 6;
+  string comm = 7;
+  string target = 8;
+  // Latency of the LSM hook itself, measured inside the BPF program.
+  uint64 latency_ns = 9;
+  // Ready-made Common Event Format record for the portal and for shipping to a
+  // SIEM, e.g. "CEF:0|AegisCPG|KernelLSM|1.0|100|DENY_EXECVE|src=...".
+  string cef = 10;
+  string tacr_tool_id = 11;
+}
+
+// ---------------------------------------------------------------------------
+// FIDO2 step-up, shared by the gateway, the Tauri tray and the Flutter client.
+// ---------------------------------------------------------------------------
+
+message Fido2Challenge {
+  string challenge_id = 1;
+  // Base64url of the 32-byte challenge nonce.
+  string challenge_b64 = 2;
+  string rp_id = 3;
+  // SHA256(challenge_id || agent_id || datum_hash || target || expiry_unix).
+  string binding_digest_b64 = 4;
+  int64 expiry_unix = 5;
+  // Human-readable lattice transition for the approval UI, e.g. "SECRET -> PUBLIC".
+  string lattice_diff = 6;
+}
+
+message Fido2ApprovalRequest {
+  string challenge_id = 1;
+  // Serialised WebAuthn assertion (authenticatorData || clientDataJSON || signature).
+  string webauthn_assertion_b64 = 2;
+  string credential_id_b64 = 3;
+  string agent_id = 4;
+}
+
+message Fido2ApprovalResponse {
+  bool verified = 1;
+  string rejection_reason = 2;
+  // Populated when the assertion failed the strictly-increasing-counter check,
+  // which is the replay defence for TV22.
+  uint64 last_seen_counter = 3;
+  uint64 presented_counter = 4;
+  int64 expiry_unix = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Service.
+// ---------------------------------------------------------------------------
+service AegisControlPlane {
+  // Stage 2. Unary: the gateway scores exactly one tool per decision and needs
+  // the score before it can allow the call, so streaming would only add
+  // scheduling latency to the hot path.
+  rpc EvaluateSemanticDivergence (DivergenceRequest) returns (DivergenceResponse);
+
+  // Stage 3. Unary: synthesis is a batch step that runs offline, not per call.
+  rpc SynthesizeMinCutPolicy (PolicySynthesisRequest) returns (TacrContractProto);
+
+  // Stage 4. Server-streaming: ringbuf events arrive continuously and the
+  // portal renders them live; a unary poll would either drop events under load
+  // or add latency.
+  rpc StreamKernelTelemetry (TelemetrySubscription) returns (stream KernelAuditEventProto);
+
+  // Step-up authorisation. Kept on the same service so the gateway holds a
+  // single connection for both the hot path and the rare declassification.
+  rpc RequestFido2Challenge (Fido2ApprovalRequest) returns (Fido2Challenge);
+  rpc SubmitFido2Approval (Fido2ApprovalRequest) returns (Fido2ApprovalResponse);
+}

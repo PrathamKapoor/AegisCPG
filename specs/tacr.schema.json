@@ -1,0 +1,360 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/PrathamKapoor/AegisCPG/specs/tacr.schema.json",
+  "title": "AegisCPG Tool Attestation & Capability Record (TACR)",
+  "description": "Author: Pratham Kapoor <prathamkapoor027@gmail.com>. The TACR is the single signed artefact produced by Stage 3 (Z3/TLA+ compositional verification plus OR-Tools MILP least-privilege synthesis) and consumed by Stage 4 (eBPF LSM policy compilation and the Rust Axum edit-automaton gateway). It is a DERIVED artefact: it can always be rebuilt from the source repository and the agent workflow graph, and it is never a system of record. Version fields are part of the canonicalised body so that a downgrade is itself detectable (TV6).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "tacr_version",
+    "tool_id",
+    "server_id",
+    "server_version",
+    "ast_dtg_sha256",
+    "semantic_divergence_score",
+    "security_lattice_label",
+    "granted_capabilities",
+    "composition_policy",
+    "ttl_seconds",
+    "issued_at_unix",
+    "ecdsa_p256_signature"
+  ],
+  "properties": {
+    "tacr_version": {
+      "description": "Schema version of this record. Downgrading this field is a detectable version rollback (TV6).",
+      "type": "integer",
+      "const": 1
+    },
+    "tool_id": {
+      "description": "Stable identifier of the attested tool, e.g. 'fs.read_file'.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9_.:\\-]+$"
+    },
+    "server_id": {
+      "description": "Stable identifier of the hosting MCP/A2A server.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9_.:\\-]+$"
+    },
+    "server_version": {
+      "description": "Semantic version of the server package that produced the attested DTG.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.\\-]+)?(?:\\+[0-9A-Za-z.\\-]+)?$"
+    },
+
+    "ast_dtg_sha256": {
+      "description": "SHA-256 over the JCS-canonicalised CompressedDtg: H(SHA256(JCS({server_id, language, nodes sorted by id, edges sorted by (source,target,transform_fn), sinks sorted by (file_path,line,sink_kind)}))). Binding both the syntactic schema and the compressed data-transformation graph is what makes a rug pull (TC2/TV5) a hash mismatch rather than a silent capability change.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "syntactic_schema_sha256": {
+      "description": "SHA-256 of the declared JSON Schema only. Retained so a consumer can attribute a divergence to the schema half or the DTG half of the Tool Integrity property.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+
+    "semantic_divergence_score": {
+      "description": "Output of the GAT + GBDT two-branch classifier over the 3-hop DTG neighbourhood, in [0,1]. Scores at or above 0.50 make every capability in detected_sinks ineligible for a grant (hard constraint x_c = 0 in the MILP).",
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0
+    },
+    "divergence_attributions": {
+      "description": "Per-branch explanation of the divergence score, so an operator can audit WHY a tool was scored. Emitted by ml-rag-engine/aegis_ml/gat_divergence.py.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "gat_score": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+        "gbdt_score": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+        "description_cosine_distance": { "type": "number", "minimum": 0.0, "maximum": 2.0 },
+        "capability_iou": {
+          "description": "Jaccard index between the declared capability set and the capability set the DTG actually reaches.",
+          "type": "number", "minimum": 0.0, "maximum": 1.0
+        },
+        "reached_sinks": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "FileRead", "FileWrite", "CommandExec",
+              "NetworkOutbound", "NetworkInbound", "EnvAccess", "UnboundedDynamic"
+            ]
+          },
+          "uniqueItems": true
+        },
+        "shannon_entropy": { "type": "number", "minimum": 0.0, "maximum": 8.0 },
+        "cyclomatic_complexity": { "type": "integer", "minimum": 1 }
+      }
+    },
+
+    "detected_sinks": {
+      "description": "Every OS-level sink the 3-hop DTG slice reaches, with file/line provenance. This is the ambient attack surface from which the MILP selects a minimum sufficient subset.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["sink_kind", "file_path", "line", "function"],
+        "properties": {
+          "sink_kind": {
+            "type": "string",
+            "enum": [
+              "FileRead", "FileWrite", "CommandExec",
+              "NetworkOutbound", "NetworkInbound", "EnvAccess", "UnboundedDynamic"
+            ]
+          },
+          "file_path": { "type": "string", "minLength": 1 },
+          "line": { "type": "integer", "minimum": 1 },
+          "function": { "type": "string", "minLength": 1 },
+          "hop_depth": { "type": "integer", "minimum": 0, "maximum": 3 }
+        }
+      }
+    },
+
+    "security_lattice_label": {
+      "description": "Denning security lattice level of the highest-classification data this tool can move. PUBLIC(0) is the bottom element. Every datum at or below this level may flow to a server whose clearance is at least as high; anything above requires an explicit FIDO2 declassification.",
+      "type": "string",
+      "enum": ["PUBLIC", "INTERNAL", "CONFIDENTIAL", "SECRET"]
+    },
+    "lattice_level": {
+      "description": "Numeric encoding of security_lattice_label: PUBLIC=0, INTERNAL=1, CONFIDENTIAL=2, SECRET=3. Denied when absent; the gateway derives it from the label.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 3
+    },
+
+    "granted_capabilities": {
+      "description": "The MILP-optimal least-privilege capability set. Every entry is consumed directly by crates/aegis-ebpf-loader/src/policy_compiler.rs to emit BPF map entries.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file_read_prefixes", "file_write_prefixes", "allowed_exec_sha256", "allowed_net_cidrs"],
+      "properties": {
+        "file_read_prefixes": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "pattern": "^(/|\\\\|[A-Za-z]:\\\\)" },
+          "uniqueItems": true
+        },
+        "file_write_prefixes": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "pattern": "^(/|\\\\|[A-Za-z]:\\\\)" },
+          "uniqueItems": true
+        },
+        "allowed_exec_sha256": {
+          "description": "MUST be empty whenever detected_sinks contains UnboundedDynamic: dynamic reflection makes static exec completeness undecidable, so AegisCPG fails closed (ADR-005). Asserted by invariant I4.",
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "uniqueItems": true
+        },
+        "allowed_net_cidrs": {
+          "description": "MUST be empty whenever detected_sinks contains UnboundedDynamic. Same fail-closed rule as allowed_exec_sha256.",
+          "type": "array",
+          "items": { "type": "string", "pattern": "^([0-9]{1,3}\\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$" },
+          "uniqueItems": true
+        },
+        "allow_env_read": { "type": "boolean", "default": false },
+        "allow_dynamic_reflection": {
+          "description": "Operator-approved escape hatch for benign dynamic tooling. Never inferred; requires an explicit reviewed grant, and still leaves allowed_exec_sha256 empty.",
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+
+    "composition_policy": {
+      "description": "Constraints on how this tool may participate in multi-tool sequences. denying a downstream tool does not prevent a chain of length three that skips the denied middle hop, so composition_policy is enforced over the DTG reachability relation and not over a naive adjacency list.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deny_downstream_tools", "require_fido2_declassify_for_lattice_below"],
+      "properties": {
+        "deny_downstream_tools": {
+          "description": "Server/tool pairs that may never receive this tool's output.",
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "require_fido2_declassify_for_lattice_below": {
+          "description": "DAGs at or below this lattice level may not receive this tool's output without a verified WebAuthn/FIDO2 P-256 assertion. SECRET (the bottom element) means: never, even under declassification.",
+          "type": "string",
+          "enum": ["PUBLIC", "INTERNAL", "CONFIDENTIAL", "SECRET"]
+        },
+        "max_chain_hops": {
+          "description": "Upper bound on compositional chain length considered by the verifier.",
+          "type": "integer", "minimum": 1, "maximum": 3, "default": 3
+        }
+      }
+    },
+
+    "compression_stats": {
+      "description": "Raw CPG size versus compressed DTG size. Persisted so the ADR-002 compression claim is auditable per server rather than asserted globally.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["raw_cpg_node_count", "compressed_node_count"],
+      "properties": {
+        "raw_cpg_node_count": { "type": "integer", "minimum": 1 },
+        "compressed_node_count": { "type": "integer", "minimum": 1 },
+        "compression_ratio": { "type": "number", "minimum": 0.0, "maximum": 0.999 }
+      }
+    },
+
+    "verification": {
+      "description": "Record of the Stage 3 proof obligations discharged for this tool.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "solver": { "type": "string", "enum": ["z3", "rust-product-automaton", "both"] },
+        "solve_time_ms": { "type": "number", "minimum": 0.0 },
+        "tlc_model_checked": { "type": "boolean", "default": false },
+        "properties_verified": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "Property 1: Tool Integrity",
+              "Property 2: Data Confinement",
+              "Property 3: Privilege Boundedness",
+              "Property 4: Context Isolation"
+            ]
+          },
+          "uniqueItems": true
+        },
+        "counterexample_trace": {
+          "description": "Constructive witness emitted when a property fails. Absence of this field means the corresponding property is discharged.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["violated_property", "source_tool", "sink_tool", "source_lattice", "target_clearance", "witness_steps"],
+          "properties": {
+            "violated_property": { "type": "string", "minLength": 1 },
+            "source_tool": { "type": "string", "minLength": 1 },
+            "sink_tool": { "type": "string", "minLength": 1 },
+            "source_lattice": { "type": "string", "enum": ["PUBLIC", "INTERNAL", "CONFIDENTIAL", "SECRET"] },
+            "target_clearance": { "type": "string", "enum": ["PUBLIC", "INTERNAL", "CONFIDENTIAL", "SECRET"] },
+            "solve_time_ms": { "type": "number", "minimum": 0.0 },
+            "witness_steps": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["step", "action", "server_id"],
+                "properties": {
+                  "step": { "type": "integer", "minimum": 0 },
+                  "action": {
+                    "type": "string",
+                    "enum": [
+                      "InitializeSession", "InvokeToolRead", "InvokeToolWrite",
+                      "MutateToolDefinition", "Fido2Declassify"
+                    ]
+                  },
+                  "server_id": { "type": "string", "minLength": 1 },
+                  "tool_id": { "type": ["string", "null"] },
+                  "lattice_level": { "type": ["integer", "null"], "minimum": 0, "maximum": 3 },
+                  "note": { "type": "string" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "ttl_seconds": {
+      "description": "Lifetime of this grant. Capability grants are explicitly expiring; an agent must re-attest rather than hold a standing ambient capability.",
+      "type": "integer",
+      "minimum": 60,
+      "maximum": 86400
+    },
+    "issued_at_unix": {
+      "description": "Issue timestamp, seconds since the Unix epoch, UTC.",
+      "type": "integer",
+      "minimum": 1700000000
+    },
+
+    "ecdsa_p256_signature": {
+      "description": "Detached ECDSA P-256 signature over the JCS-canonicalised record with this field removed, encoded as 64 raw bytes (r||s) in unpadded base64url. Verification is public-key only, so a third party can validate a TACR with no shared secret (ADR-012).",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{86}$"
+    },
+    "signing_key_id": {
+      "description": "Thumbprint of the ES256 public key, SPKI SHA-256, base64url. Lets a consumer select the correct key from a transparency log.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{43}$"
+    }
+  },
+
+  "allOf": [
+    {
+      "$comment": "ADR-005 fail-closed contract: dynamic reflection makes static exec/net completeness undecidable, so a tool whose DTG contains UnboundedDynamic can carry neither an exec allowlist nor a net CIDR list.",
+      "if": {
+        "properties": {
+          "detected_sinks": {
+            "type": "array",
+            "contains": {
+              "type": "object",
+              "properties": { "sink_kind": { "const": "UnboundedDynamic" } },
+              "required": ["sink_kind"]
+            }
+          }
+        },
+        "required": ["detected_sinks"]
+      },
+      "then": {
+        "properties": {
+          "granted_capabilities": {
+            "properties": {
+              "allowed_exec_sha256": { "maxItems": 0 },
+              "allowed_net_cidrs": { "maxItems": 0 }
+            }
+          }
+        }
+      }
+    },
+    {
+      "$comment": "A tool that reaches CommandExec without an operator-reviewed exec allowlist has no enforceable exec grant. The capability set must not claim otherwise.",
+      "if": {
+        "properties": {
+          "detected_sinks": {
+            "type": "array",
+            "contains": {
+              "type": "object",
+              "properties": { "sink_kind": { "const": "CommandExec" } },
+              "required": ["sink_kind"]
+            }
+          }
+        },
+        "required": ["detected_sinks"]
+      },
+      "then": {
+        "properties": {
+          "granted_capabilities": {
+            "required": ["allowed_exec_sha256"],
+            "properties": { "allow_dynamic_reflection": { "const": false } }
+          }
+        }
+      }
+    },
+    {
+      "$comment": "A converged graph carries no sink at all, so the lattice label must be PUBLIC and no OS capability may be granted.",
+      "if": {
+        "properties": {
+          "detected_sinks": { "type": "array", "maxItems": 0 }
+        },
+        "required": ["detected_sinks"]
+      },
+      "then": {
+        "properties": {
+          "security_lattice_label": { "const": "PUBLIC" },
+          "granted_capabilities": {
+            "properties": {
+              "file_read_prefixes": { "maxItems": 0 },
+              "file_write_prefixes": { "maxItems": 0 },
+              "allowed_exec_sha256": { "maxItems": 0 },
+              "allowed_net_cidrs": { "maxItems": 0 }
+            }
+          }
+        }
+      }
+    }
+  ]
+}
