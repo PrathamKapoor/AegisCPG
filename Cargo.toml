@@ -17,6 +17,7 @@ resolver = "2"
 members = [
     "crates/aegis-common",
     "crates/aegis-dtg-parser",
+    "crates/aegis-smt-verifier",
 ]
 
 # The portable toolchain bootstrap must never be mistaken for a workspace member.
