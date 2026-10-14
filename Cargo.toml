@@ -20,6 +20,7 @@ members = [
     "crates/aegis-smt-verifier",
     "crates/aegis-ebpf-loader",
     "crates/aegis-proxy-gateway",
+    "crates/aegis-cli",
 ]
 
 # The portable toolchain bootstrap must never be mistaken for a workspace member.
@@ -47,6 +48,9 @@ categories = ["security", "development-tools::debugging"]
 # --- Internal ---------------------------------------------------------------
 aegis-common = { path = "crates/aegis-common", version = "1.0.0" }
 aegis-dtg-parser = { path = "crates/aegis-dtg-parser", version = "1.0.0" }
+aegis-smt-verifier = { path = "crates/aegis-smt-verifier", version = "1.0.0" }
+aegis-ebpf-loader = { path = "crates/aegis-ebpf-loader", version = "1.0.0" }
+aegis-proxy-gateway = { path = "crates/aegis-proxy-gateway", version = "1.0.0" }
 
 # --- Serialisation ----------------------------------------------------------
 serde = { version = "1.0", features = ["derive"] }

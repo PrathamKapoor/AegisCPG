@@ -1,0 +1,29 @@
+# AegisCPG -- unified command-line interface.
+#
+# Author: Pratham Kapoor <prathamkapoor027@gmail.com>
+# https://github.com/PrathamKapoor
+
+[package]
+name = "aegis-cli"
+description = "Command-line entry point for the AegisCPG four-stage MCP/A2A verifier."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "aegis-cli"
+path = "src/main.rs"
+
+[dependencies]
+aegis-common.workspace = true
+aegis-dtg-parser.workspace = true
+aegis-smt-verifier.workspace = true
+aegis-ebpf-loader.workspace = true
+serde.workspace = true
+serde_json.workspace = true
