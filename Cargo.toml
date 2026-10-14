@@ -1,0 +1,74 @@
+# AegisCPG workspace manifest.
+#
+# Author: Pratham Kapoor <prathamkapoor027@gmail.com>
+# https://github.com/PrathamKapoor
+#
+# WHAT:   Root Cargo workspace for the six AegisCPG crates.
+# WHY:    One workspace, one lockfile, one `cargo test --workspace` gate. A
+#         verifier whose crates can be built independently can also be
+#         version-skewed independently, and a hash pinned by one crate is
+#         meaningless to another.
+# HOW:    Path dependencies only. No git or registry self-references, so the
+#         workspace builds offline once crates.io deps are vendored, and no
+#         dependency can phone home at build time (ADR-001).
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/aegis-common",
+    "crates/aegis-dtg-parser",
+]
+
+# The portable toolchain bootstrap must never be mistaken for a workspace member.
+exclude = [".toolchain", "target"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+authors = ["Pratham Kapoor <prathamkapoor027@gmail.com>"]
+repository = "https://github.com/PrathamKapoor/AegisCPG"
+homepage = "https://github.com/PrathamKapoor"
+keywords = [
+    "mcp",
+    "a2a",
+    "formal-verification",
+    "ebpf",
+    "zero-llm",
+    "static-analysis",
+]
+categories = ["security", "development-tools::debugging"]
+
+[workspace.dependencies]
+# --- Internal ---------------------------------------------------------------
+aegis-common = { path = "crates/aegis-common", version = "1.0.0" }
+aegis-dtg-parser = { path = "crates/aegis-dtg-parser", version = "1.0.0" }
+
+# --- Serialisation ----------------------------------------------------------
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+
+# --- Hashing / signatures ---------------------------------------------------
+sha2 = "0.10"
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pem", "std"] }
+pkcs8 = { version = "0.10", features = ["pem", "alloc"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# --- Error handling ---------------------------------------------------------
+thiserror = "1.0"
+
+# --- Misc -------------------------------------------------------------------
+hex = "0.4"
+base64 = "0.22"
+once_cell = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[profile.dev]
+opt-level = 0
+debug = true

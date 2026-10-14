@@ -1,0 +1,25 @@
+# AegisCPG -- polyglot Data Transformation Graph extractor.
+#
+# Author: Pratham Kapoor <prathamkapoor027@gmail.com>
+# https://github.com/PrathamKapoor
+
+[package]
+name = "aegis-dtg-parser"
+description = "Polyglot AST-to-DTG extraction and bounded 3-hop compression for AegisCPG."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+aegis-common.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,19 @@
+# AegisCPG -- cargo configuration.
+#
+# Author: Pratham Kapoor <prathamkapoor027@gmail.com>
+# https://github.com/PrathamKapoor
+#
+# WHAT: Workspace-wide cargo settings that are portable across developer hosts.
+# WHY:  Anything host-specific belongs in `.toolchain/env.ps1`, which computes it
+#       at shell start, not here. Hard-coding an absolute SDK path into a
+#       committed manifest would break every host except the one it was written
+#       on -- which is exactly the failure that makes a workspace unbuildable
+#       for anyone but its author.
+# HOW:  `.toolchain/env.ps1` sets CARGO_TARGET_DIR, the target linker, and the
+#       RUSTFLAGS library search paths from whatever xwin actually splatted.
+
+[net]
+retry = 3
+
+[term]
+color = "auto"

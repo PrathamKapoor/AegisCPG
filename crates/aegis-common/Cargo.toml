@@ -1,0 +1,32 @@
+# AegisCPG -- shared types, security lattice, TACR records, and cryptography.
+#
+# Author: Pratham Kapoor <prathamkapoor027@gmail.com>
+# https://github.com/PrathamKapoor
+
+[package]
+name = "aegis-common"
+description = "Shared data structures, Denning security lattice arithmetic, TACR serialisation, and ECDSA P-256 attestation for AegisCPG."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+p256.workspace = true
+pkcs8.workspace = true
+rand_core.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+base64.workspace = true
+once_cell.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
