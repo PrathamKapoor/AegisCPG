@@ -19,6 +19,7 @@ members = [
     "crates/aegis-dtg-parser",
     "crates/aegis-smt-verifier",
     "crates/aegis-ebpf-loader",
+    "crates/aegis-proxy-gateway",
 ]
 
 # The portable toolchain bootstrap must never be mistaken for a workspace member.

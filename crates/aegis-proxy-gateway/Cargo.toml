@@ -1,0 +1,35 @@
+# AegisCPG -- inline JSON-RPC / A2A edit-automaton gateway.
+#
+# Author: Pratham Kapoor <prathamkapoor027@gmail.com>
+# https://github.com/PrathamKapoor
+
+[package]
+name = "aegis-proxy-gateway"
+description = "Inline MCP/A2A proxy enforcing the AegisCPG edit automaton, session taint tracking, and FIDO2 step-up."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+name = "aegis_proxy_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aegis-proxy-gateway"
+path = "src/main.rs"
+
+[dependencies]
+aegis-common.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
+sha2.workspace = true
+base64.workspace = true
+hex.workspace = true
