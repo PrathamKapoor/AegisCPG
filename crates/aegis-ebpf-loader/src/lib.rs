@@ -32,6 +32,7 @@
 //! Denials are returned as `-EPERM` before image replacement and before packet
 //! transmission: 0 bytes exfiltrated.
 
+pub mod bpf_layout;
 pub mod policy_compiler;
 pub mod ringbuf_reader;
 

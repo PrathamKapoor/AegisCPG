@@ -1,0 +1,79 @@
+# AegisCPG -- reproducible eBPF build environment.
+#
+# Author: Pratham Kapoor <prathamkapoor027@gmail.com>
+# https://github.com/PrathamKapoor
+#
+# WHAT:  A self-contained Linux image that compiles lsm_enforcer.bpf.c with a
+#        pinned clang, so the BPF object is reproducible from any host --
+#        including Windows, which has no BPF-capable toolchain at all.
+# WHY:   eBPF LSM needs kernel >= 5.7 with CONFIG_BPF_LPM=y and a kernel booted
+#        with `lsm=...,bpf`. That combination does not exist on a Windows dev
+#        machine, and installing a virtualised Linux kernel to compile one file
+#        is not a reasonable price. Containerising the *build* keeps the toolchain
+#        requirement on the deployable side of the boundary, where it belongs.
+#
+#        Note what this image does NOT do: it cannot make BPF LSM work on the
+#        Windows host. Enforcement still requires a Linux kernel with
+#        CONFIG_BPF_LSM. On other hosts AegisCPG runs the Rust edit automaton plus
+#        a seccomp filter and reports the reduced guarantee explicitly rather
+#        than pretending it is equivalent (ADR-004).
+#
+# HOW:   Build from the repository root so the context includes lsm_enforcer.bpf.c:
+#          docker build -f ebpf-probes/Dockerfile.ebpf-runner -t aegis-ebpf ebpf-probes
+#        Build and extract the object:
+#          docker create --name aegis-bpf aegis-ebpf
+#          docker cp aegis-bpf:/out/lsm_enforcer.bpf.o ./lsm_enforcer.bpf.o
+#          docker rm aegis-bpf
+
+FROM debian:bookworm-slim
+
+ARG LLVM_VERSION=19
+ARG DEBIAN_FRONTEND=noninteractive
+
+# clang-$LLVM_VERSION      -> the BPF backend and the kernel headers it needs
+# libbpf-dev               -> bpf_helpers.h and bpf_tracing.h
+# linux-headers-amd64      -> struct file, struct socket, struct linux_binprm
+# llvm-$LLVM_VERSION       -> llvm-strip, for the 1 MiB object size limit
+# make, bpftool            -> the build and a verifier preflight
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang-$LLVM_VERSION \
+        llvm-$LLVM_VERSION \
+        libbpf-dev \
+        linux-headers-amd64 \
+        make \
+        gcc \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy the program first so the toolchain layer caches independently of source.
+COPY lsm_enforcer.bpf.c ./
+COPY Makefile ./
+
+RUN set -eux; \
+    mkdir -p /out; \
+    make ARCH=x86_64; \
+    # Preflight: refuse to ship an object the kernel verifier would reject.
+    # A program that fails to load is discovered at deploy time, on production,
+    # which is far too late.
+    llvm-objdump -h lsm_enforcer.bpf.o; \
+    size=$(stat -c%s lsm_enforcer.bpf.o); \
+    echo "object size: ${size} bytes"; \
+    if [ "$size" -gt 1048576 ]; then \
+        echo "object exceeds the 1 MiB BPF program limit"; exit 1; \
+    fi; \
+    # Assert the three LSM sections are present and that no stray syscall_trace
+    # program slipped in -- a syscall_trace hook would silently provide none of
+    # the guarantees this system claims.
+    for sec in lsm/bprm_check_security lsm/file_open lsm/socket_connect; do \
+        llvm-objdump -h lsm_enforcer.bpf.o | grep -q "$sec" \
+            || { echo "missing required section: $sec"; exit 1; }; \
+    done; \
+    if llvm-objdump -h lsm_enforcer.bpf.o | grep -q syscall_trace; then \
+        echo "unexpected syscall_trace section: it does not enforce pre-effect"; exit 1; \
+    fi; \
+    cp lsm_enforcer.bpf.o /out/lsm_enforcer.bpf.o; \
+    echo "verified and staged at /out/lsm_enforcer.bpf.o"
+
+CMD ["ls", "-l", "/out/lsm_enforcer.bpf.o"]

@@ -27,7 +27,20 @@ use crate::policy_compiler::{HookType, KernelEvent, Verdict};
 use std::collections::VecDeque;
 
 /// Byte layout of `struct aegis_kernel_event`, mirroring the BPF C exactly.
-pub const EVENT_SIZE_BYTES: usize = 8 + 8 + 4 + 4 + 4 + 4 + 16 + 128;
+///
+/// 8 (timestamp_ns) + 8 (cgroup_id) + 4 (pid) + 4 (uid) + 4 (hook_type)
+/// + 4 (verdict) + 8 (latency_ns) + 16 (comm) + 128 (target) = 184.
+///
+/// Field offsets, asserted against the C source by `crate::bpf_layout`:
+///   0 timestamp_ns | 8 cgroup_id | 16 pid | 20 uid | 24 hook_type
+///   | 28 verdict | 32 latency_ns | 40 comm[16] | 56 target[128]
+///
+/// The first version of this decoder omitted `latency_ns` and read `comm` from
+/// offset 32 -- shifting every subsequent field by eight bytes. Every denial
+/// decoded into a plausible-looking but wrong event. The C/Rust cross-check in
+/// `bpf_layout` exists precisely to make that class of mistake impossible to
+/// ship.
+pub const EVENT_SIZE_BYTES: usize = 8 + 8 + 4 + 4 + 4 + 4 + 8 + 16 + 128;
 
 /// Sentinel appended to fixed-width character arrays so a truncated `comm` or
 /// `target` cannot be mistaken for a full one.
@@ -96,7 +109,8 @@ fn i32_at(buf: &[u8], offset: usize) -> i32 {
 /// Decodes one ring-buffer record.
 ///
 /// Field offsets, in order: timestamp_ns(0..8), cgroup_id(8..16), pid(16..20),
-/// uid(20..24), hook_type(24..28), verdict(28..32), comm(32..48), target(48..176).
+/// uid(20..24), hook_type(24..28), verdict(28..32), latency_ns(32..40),
+/// comm(40..56), target(56..184).
 pub fn decode(buf: &[u8]) -> Result<KernelEvent, DecodeError> {
     if buf.len() != EVENT_SIZE_BYTES {
         return Err(DecodeError::BadLength { got: buf.len() });
@@ -114,8 +128,9 @@ pub fn decode(buf: &[u8]) -> Result<KernelEvent, DecodeError> {
         _ => Verdict::DenyEperm,
     };
 
-    let comm = read_field(&buf[32..48], "comm")?;
-    let target = read_field(&buf[48..176], "target")?;
+    let latency_ns = u64_at(buf, 32);
+    let comm = read_field(&buf[40..56], "comm")?;
+    let target = read_field(&buf[56..184], "target")?;
 
     Ok(KernelEvent {
         timestamp_ns: u64_at(buf, 0),
@@ -126,7 +141,7 @@ pub fn decode(buf: &[u8]) -> Result<KernelEvent, DecodeError> {
         verdict,
         comm,
         target,
-        latency_ns: 0,
+        latency_ns,
     })
 }
 
@@ -140,14 +155,15 @@ pub fn encode(ev: &KernelEvent) -> Vec<u8> {
     buf[20..24].copy_from_slice(&ev.uid.to_le_bytes());
     buf[24..28].copy_from_slice(&ev.hook_type.code().to_le_bytes());
     buf[28..32].copy_from_slice(&ev.errno().to_le_bytes());
+    buf[32..40].copy_from_slice(&ev.latency_ns.to_le_bytes());
 
     let comm = ev.comm.as_bytes();
     let n = comm.len().min(15);
-    buf[32..32 + n].copy_from_slice(&comm[..n]);
+    buf[40..40 + n].copy_from_slice(&comm[..n]);
 
     let target = ev.target.as_bytes();
     let n = target.len().min(127);
-    buf[48..48 + n].copy_from_slice(&target[..n]);
+    buf[56..56 + n].copy_from_slice(&target[..n]);
 
     buf
 }
@@ -283,8 +299,8 @@ mod tests {
 
     #[test]
     fn wire_layout_is_the_documented_size() {
-        // 8 + 8 + 4 + 4 + 4 + 4 + 16 + 128
-        assert_eq!(EVENT_SIZE_BYTES, 176);
+        // 8 + 8 + 4 + 4 + 4 + 4 + 8 + 16 + 128
+        assert_eq!(EVENT_SIZE_BYTES, 184);
         assert_eq!(encode(&event()).len(), EVENT_SIZE_BYTES);
     }
 
@@ -300,6 +316,7 @@ mod tests {
         assert_eq!(back.verdict, ev.verdict);
         assert_eq!(back.comm, ev.comm);
         assert_eq!(back.target, ev.target);
+        assert_eq!(back.latency_ns, ev.latency_ns);
     }
 
     #[test]
@@ -321,7 +338,7 @@ mod tests {
     fn truncated_fields_are_rejected_not_silently_truncated() {
         let mut buf = encode(&event());
         // Fill `comm` with no NUL anywhere.
-        for b in &mut buf[32..48] {
+        for b in &mut buf[40..56] {
             *b = b'x';
         }
         assert_eq!(

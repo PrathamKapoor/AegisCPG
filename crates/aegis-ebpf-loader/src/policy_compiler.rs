@@ -311,6 +311,16 @@ pub enum Verdict {
     DenyEperm,
 }
 
+impl Verdict {
+    /// The errno the BPF program returns for this verdict.
+    pub const fn errno_code(self) -> i32 {
+        match self {
+            Verdict::Allow => 0,
+            Verdict::DenyEperm => -1,
+        }
+    }
+}
+
 /// A single audit event, mirroring `struct aegis_kernel_event`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelEvent {
