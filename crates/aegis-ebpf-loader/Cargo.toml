@@ -1,0 +1,22 @@
+# AegisCPG -- eBPF LSM policy loader.
+#
+# Author: Pratham Kapoor <prathamkapoor027@gmail.com>
+# https://github.com/PrathamKapoor
+
+[package]
+name = "aegis-ebpf-loader"
+description = "Compile TACR contracts into eBPF LSM map entries and decode kernel audit telemetry."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+aegis-common.workspace = true
+serde.workspace = true
+serde_json.workspace = true
