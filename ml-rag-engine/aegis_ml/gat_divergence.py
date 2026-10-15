@@ -45,6 +45,7 @@ import json
 import math
 import os
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Sequence
 
@@ -175,6 +176,18 @@ TABULAR_NAMES = (
 # Sinks that make a tool dangerous enough to fail the MILP's threshold.
 HIGH_RISK_SINKS = frozenset(
     {"CommandExec", "NetworkOutbound", "UnboundedDynamic", "EnvAccess", "FileWrite"}
+)
+
+#: Package names a deployment is assumed to have vetted. A dependency within two
+#: edits of one of these -- and not equal to it -- is the typosquat signal.
+#: Kept explicit rather than learned: a registry this security tool trusts must
+#: be auditable by whoever reads it, not inferred from data.
+KNOWN_GOOD_PACKAGES: tuple[str, ...] = (
+    "slack-mcp-server",
+    "github-mcp-server",
+    "filesystem-mcp",
+    "postgres-mcp",
+    "mcp-shield-server",
 )
 
 # Phrase -> capability anchors, shared with the retriever so the two stages
@@ -763,13 +776,13 @@ class DeterministicSubwordEncoderCompat:
 
     Importing the retriever module here would create a circular dependency
     (the retriever does not know about the classifier, but keeping the encoder in
-    one place avoids the two drifting apart).
+    one place avoids the two drifting apart). The instance is process-wide: the
+    encoder is a pure function, and rebuilding its tables per call was more than
+    half of `predict`'s runtime.
     """
 
     def encode(self, text: str) -> np.ndarray:
-        from .hybrid_indexer import DeterministicSubwordEncoder
-
-        return DeterministicSubwordEncoder().encode(text)
+        return _shared_encoder().encode(text)
 
 # ---------------------------------------------------------------------------
 # Tree ensemble -> ONNX
@@ -1109,6 +1122,18 @@ class DivergenceReport:
         }
 
 
+def _make_session(path: Path):
+    """Open an `InferenceSession`.
+
+    Session options are left at onnxruntime's defaults on the basis of a
+    measurement, not a guess: on this host an explicit `ORT_ENABLE_ALL` cost
+    2.30 ms per call against the default's 1.93 ms, because the graph is small
+    enough that the optimiser's own bookkeeping costs more than it saves.
+    `scripts/latency_probe.py` reproduces that comparison.
+    """
+    return ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+
+
 class DivergenceModel:
     """The trained two-branch classifier, with an ONNX inference path."""
 
@@ -1216,9 +1241,7 @@ class DivergenceModel:
         target.parent.mkdir(parents=True, exist_ok=True)
         onnx.save_model(model, str(target))
 
-        self.session = ort.InferenceSession(
-            str(target), providers=["CPUExecutionProvider"]
-        )
+        self.session = _make_session(target)
         self.backend = "onnxruntime"
         self.model_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
         return target
@@ -1231,9 +1254,7 @@ class DivergenceModel:
         if not target.exists():
             return False
         onnx.checker.check_model(onnx.load(str(target)))
-        self.session = ort.InferenceSession(
-            str(target), providers=["CPUExecutionProvider"]
-        )
+        self.session = _make_session(target)
         self.backend = "onnxruntime"
         self.model_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
         return True
@@ -1295,6 +1316,12 @@ class DivergenceModel:
         encoder = DeterministicSubwordEncoderCompat()
         description_vec = encoder.encode(description)
         features, graph, _alphas = self.features_for(dtg, description, description_vec)
+        # The sink encoding is already inside `graph`; recomputing it here would
+        # be a third encode per call. The array is cached and read-only.
+        sink_text = " ".join(sorted(graph.sink_kinds)) or "none"
+        description_distance = float(
+            cosine_distance(description_vec, _sink_vector(sink_text))
+        )
 
         started = time.perf_counter()
         if self.session is not None:
@@ -1341,9 +1368,7 @@ class DivergenceModel:
             score=score,
             gat_score=gat_score,
             gbdt_score=gbdt_score,
-            description_cosine_distance=float(
-                cosine_distance(description_vec, _sink_vector(" ".join(sorted(graph.sink_kinds)) or "none"))
-            ),
+            description_cosine_distance=description_distance,
             capability_iou=iou,
             shannon_entropy=float(features[GAT_EMBED_DIM + 4] * 8.0),
             cyclomatic_complexity=0,
@@ -1355,10 +1380,36 @@ class DivergenceModel:
         )
 
 
-def _sink_vector(sink_text: str) -> np.ndarray:
+@lru_cache(maxsize=1)
+def _shared_encoder():
+    """The one process-wide deterministic subword encoder.
+
+    The encoder is a pure function of its input, so sharing one instance is
+    safe. Constructing a fresh one per call was over half of `predict`'s runtime
+    -- three constructions per call, each rebuilding the same feature-hash
+    tables.
+    """
     from .hybrid_indexer import DeterministicSubwordEncoder
 
-    return DeterministicSubwordEncoder().encode(sink_text)
+    return DeterministicSubwordEncoder()
+
+
+@lru_cache(maxsize=512)
+def _sink_vector_cached(sink_text: str) -> np.ndarray:
+    """Encode a sink-kind string.
+
+    Cached because the domain is tiny -- at most two-to-the-seven combinations
+    of the sink taxonomy, and a fleet of tools draws from the same handful. The
+    returned array is read-only to every caller; `np.eye(0)` marks it so an
+    accidental in-place write raises rather than corrupting the cache.
+    """
+    vector = _shared_encoder().encode(sink_text)
+    vector.setflags(write=False)
+    return vector
+
+
+def _sink_vector(sink_text: str) -> np.ndarray:
+    return _sink_vector_cached(sink_text)
 
 
 def _has_injection(text: str) -> bool:
@@ -1367,16 +1418,52 @@ def _has_injection(text: str) -> bool:
     return bool(detect_injection_markers(text))
 
 
-def _has_typosquat(dtg: dict) -> bool:
-    """Heuristic typosquat signal: a package name one edit from a popular one."""
-    import difflib
+def bounded_edit_distance(a: str, b: str, limit: int = 2) -> int:
+    """Levenshtein distance, abandoned as soon as it provably exceeds ``limit``.
 
-    popular = ("slack-mcp-server", "github-mcp-server", "filesystem-mcp", "postgres-mcp")
-    packages = dtg.get("dependencies", []) or []
-    for package in packages:
-        for known in popular:
-            ratio = difflib.SequenceMatcher(None, str(package), known).ratio()
-            if ratio > 0.85 and str(package) != known:
+    Two rows of the distance matrix are kept, so this is O(len(a) * limit)
+    memory. The early abandonment is what makes it usable on the inference path:
+    a package name that shares no prefix with a known one is decided on the
+    first row.
+    """
+    if abs(len(a) - len(b)) > limit:
+        return limit + 1
+    previous = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        current = [i]
+        row_best = i
+        for j, cb in enumerate(b, start=1):
+            cost = 0 if ca == cb else 1
+            value = min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost)
+            current.append(value)
+            row_best = min(row_best, value)
+        if row_best > limit:
+            return limit + 1
+        previous = current
+    return previous[-1]
+
+
+def _has_typosquat(dtg: dict) -> bool:
+    """True when a dependency is a near-miss of a known-good package name.
+
+    A bounded Levenshtein distance rather than `difflib.SequenceMatcher.ratio`:
+    the ratio is a longest-common-subsequence heuristic whose threshold has to
+    be tuned per length pair, whereas "at most two edits from a name I know" is
+    the property actually being asserted. It is also roughly twenty times
+    cheaper -- `difflib` was the second-largest cost in `predict` after encoder
+    construction.
+    """
+    packages = [str(p) for p in (dtg.get("dependencies") or [])]
+    if not packages:
+        return False
+    # Package names are path-shaped (`@scope/pkg`, `pkg/lib/server`); only the
+    # leading segment identifies the package itself.
+    names = {p.split("/")[0].lstrip("@") for p in packages}
+    for name in names:
+        for known in KNOWN_GOOD_PACKAGES:
+            if name == known:
+                continue
+            if bounded_edit_distance(name, known, limit=2) <= 2:
                 return True
     return False
 

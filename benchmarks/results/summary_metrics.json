@@ -1,0 +1,90 @@
+{
+  "schema": "aegis.benchmarks.v1",
+  "author": "Pratham Kapoor <prathamkapoor027@gmail.com>",
+  "generated_unix": 1792043096,
+  "generated_utc": "2026-10-15T05:44:56Z",
+  "machine": {
+    "platform": "Windows-11-10.0.26100-SP0",
+    "processor": "ARMv8 (64-bit) Family 8 Model 1 Revision 201, Qualcomm Technologies Inc",
+    "python": "3.12.10",
+    "machine_tag": "ARM64"
+  },
+  "cli_binary": "target\\debug\\aegis-cli.exe",
+  "static": {
+    "fixtures": 14,
+    "vulnerable": 9,
+    "benign": 5,
+    "recall_count": 9,
+    "recall_percent": 100.0,
+    "false_positive_count": 0,
+    "false_positive_percent": 0.0,
+    "min_compression_ratio": 0.949153,
+    "mean_compression_ratio": 0.978881,
+    "max_compression_ratio": 0.993506,
+    "total_raw_nodes": 2037,
+    "total_compressed_nodes": 45,
+    "median_scan_ms": 23.4218
+  },
+  "chains": {
+    "total": 51,
+    "malicious": 36,
+    "legitimate": 15,
+    "blocked": 36,
+    "block_rate_percent": 100.0,
+    "legitimate_allowed": 15,
+    "max_witness_steps": 4
+  },
+  "divergence": {
+    "backend": "onnxruntime",
+    "model_sha256": "d082daaba52e8d2427053aba501250648f9240c1a35888b7bf923fbd095b3d4b",
+    "flagged_malicious": 9,
+    "flagged_benign": 0,
+    "min_malicious_score": 0.736121,
+    "max_benign_score": 0.001024,
+    "separation_margin": 0.735097,
+    "threshold": 0.5
+  },
+  "rag": {
+    "dense_path": "deterministic-subword-384",
+    "corpus_chunks": 25,
+    "queries": 5,
+    "mean_hybrid_ndcg_at_10": 0.637453,
+    "mean_dense_only_ndcg_at_10": 0.525518,
+    "mean_hybrid_recall_at_5": 0.283333,
+    "mean_dense_only_recall_at_5": 0.216667,
+    "queries_improved": 5
+  },
+  "latency_ms": {
+    "encode_description": 0.244,
+    "build_graph_and_gat": 0.9283,
+    "gat_forward_only": 0.4552,
+    "onnxruntime_call": 0.9523,
+    "predict_end_to_end": 2.8047
+  },
+  "latency_median_ms": {
+    "encode_description": 0.5735,
+    "build_graph_and_gat": 1.9857,
+    "gat_forward_only": 0.8459,
+    "onnxruntime_call": 2.1836,
+    "predict_end_to_end": 6.2602
+  },
+  "latency_p95_ms": {
+    "encode_description": 4.1071,
+    "build_graph_and_gat": 4.6117,
+    "gat_forward_only": 2.5132,
+    "onnxruntime_call": 3.8796,
+    "predict_end_to_end": 10.1216
+  },
+  "end_to_end_scoring_ms": 2.8047,
+  "end_to_end_scoring_median_ms": 6.2602,
+  "thresholds": {
+    "min_recall": 9,
+    "max_false_positives": 0,
+    "min_compression_ratio": 0.8,
+    "min_hybrid_ndcg": 0.6,
+    "max_benign_score": 0.05,
+    "min_benign_fixture_score_ceiling": 0.05,
+    "max_end_to_end_scoring_ms": 15.0
+  },
+  "threshold_failures": []
+}

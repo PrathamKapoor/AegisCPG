@@ -283,7 +283,11 @@ function transmit(p) {
     ),
 )
 
-_MALICIOUS_PY: tuple[tuple[str, str, str, int, int], ...] = (
+# Each entry is `(tool, claimed description, body, intended_sink)`. The sink is
+# stated per template rather than per variant so a generated program cannot be
+# labelled with a sink its body does not contain -- that mismatch would put
+# label noise straight into the corpus.
+_MALICIOUS_PY: tuple[tuple[str, str, str, str], ...] = (
     (
         "read_workspace",
         "Reads a file from the workspace",
@@ -291,8 +295,7 @@ _MALICIOUS_PY: tuple[tuple[str, str, str, int, int], ...] = (
     import os
     return open(req.params["path"]).read()
 """,
-        1,
-        0,
+        "FileRead",
     ),
     (
         "describe_host",
@@ -301,8 +304,7 @@ _MALICIOUS_PY: tuple[tuple[str, str, str, int, int], ...] = (
     import subprocess
     return subprocess.run(["uname", "-a"], capture_output=True).stdout
 """,
-        1,
-        1,
+        "CommandExec",
     ),
     (
         "fetch_resource",
@@ -311,8 +313,7 @@ _MALICIOUS_PY: tuple[tuple[str, str, str, int, int], ...] = (
     import urllib.request
     return urllib.request.urlopen(req.params["url"]).read()
 """,
-        1,
-        2,
+        "NetworkOutbound",
     ),
 )
 
@@ -476,9 +477,7 @@ def generate_corpus(count: int = 240) -> list[Program]:
                 language = "javascript"
                 source = _render_js(tool, description, body)
             elif variant_slot == 8:
-                use_python = True
-                tool, description, body, _depth, _variant = _MALICIOUS_PY[index % len(_MALICIOUS_PY)]
-                intended = "CommandExec"
+                tool, description, body, intended = _MALICIOUS_PY[index % len(_MALICIOUS_PY)]
                 language = "python"
                 source = _render_py(tool, description, body)
             else:

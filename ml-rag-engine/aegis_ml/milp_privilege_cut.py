@@ -26,10 +26,12 @@ WHY
     returns an integer optimum for this problem class.
 
 HOW
-    Risk weights come from `aegis_common::types::Capability::risk_weight()` in
-    the Rust control plane; the table below is the same ordering, kept in sync by
-    `tests/test_ml_pipeline.py::test_milp_risk_weights_match_the_rust_table`,
-    which parses the Rust source rather than trusting the copy.
+    Risk weights come from `crates/aegis-common/src/types.rs` -- from
+    `Capability::risk_weight()` for the five kernel capabilities and from
+    `SinkKind::risk_weight()` for the two that have no kernel mechanism.
+    `tests/test_rag_milp_workflow.py::test_milp_risk_weights_match_the_rust_table`
+    parses that file and asserts every weight, so a change on either side fails
+    rather than drifting silently.
 
     The constraint matrix is built once per call in ``O(|C| * |F|)`` and handed
     to HiGHS, which solves this in well under a millisecond for the seven-element
@@ -51,6 +53,11 @@ from scipy.optimize import Bounds, LinearConstraint, milp
 
 #: The capability alphabet. Order is fixed and matches `specs/proto/aegis.proto`
 #: and `specs/tacr.schema.json`; the indices are the MILP variable order.
+#:
+#: Five of these are kernel capabilities and two are userspace-only. The split
+#: matters because the risk weights come from two different Rust tables and a
+#: TACR's recorded residual risk must agree with the policy the BPF compiler
+#: produced from it.
 CAPABILITIES: tuple[str, ...] = (
     "file-read",
     "file-write",
@@ -61,17 +68,32 @@ CAPABILITIES: tuple[str, ...] = (
     "eval-dynamic",
 )
 
-#: CVSS-derived risk weights, identical to `Capability::risk_weight()` in
-#: `crates/aegis-common/src/types.rs`. `exec` is worst because a command
-#: execution primitive subsumes every other capability in the set.
+#: Those with a kernel-level enforcement mechanism. Exactly
+#: `Capability::ALL` in `crates/aegis-common/src/types.rs`.
+KERNEL_CAPABILITIES: frozenset[str] = frozenset(
+    {"file-read", "file-write", "exec", "net-out", "net-in"}
+)
+
+#: Risk weights, copied from the Rust control plane and verified against its
+#: source by `tests/test_rag_milp_workflow.py::test_milp_risk_weights_match_the_rust_table`:
+#:
+#: * the five kernel capabilities from `Capability::risk_weight()`;
+#: * `env-access` and `eval-dynamic` from `SinkKind::risk_weight()` for
+#:   `SinkKind::EnvAccess` and `SinkKind::UnboundedDynamic`, because the Rust
+#:   `Capability` enum cannot express them -- reading `process.env` has no
+#:   kernel capability bit, and the BPF program enforces neither.
+#:
+#: The scale is Rust's 0.0-1.0, not a made-up 0-10. A TACR that recorded a
+#: residual risk of 19.0 from this table and a policy compiled against 1.00
+#: would be internally inconsistent, and nothing downstream would notice.
 CAPABILITY_RISK: dict[str, float] = {
-    "file-read": 2.0,
-    "file-write": 5.0,
-    "exec": 9.5,
-    "net-out": 6.0,
-    "net-in": 4.0,
-    "env-access": 8.5,
-    "eval-dynamic": 10.0,
+    "file-read": 0.45,
+    "file-write": 0.60,
+    "exec": 1.00,
+    "net-out": 0.90,
+    "net-in": 0.40,
+    "env-access": 0.80,
+    "eval-dynamic": 0.95,
 }
 
 #: Capabilities that can, on their own, satisfy a requirement naming the same

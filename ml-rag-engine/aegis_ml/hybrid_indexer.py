@@ -116,6 +116,10 @@ SEMANTIC_ANCHORS: dict[str, tuple[str, ...]] = {
 
 _CAMEL_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
 _WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+#: Compiled once at import. Calling ``re.sub`` with a literal pattern inside a
+#: loop made CPython's own cache the hot path, which is slower than a module
+#: level compiled pattern.
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]")
 _B64_RE = re.compile(r"[A-Za-z0-9+/]{24,}={0,2}")
 
 
@@ -143,6 +147,17 @@ def char_ngrams(text: str, sizes: Sequence[int] = (3, 4, 5)) -> list[str]:
     return out
 
 
+#: Every feature the encoder has already hashed, keyed by ``(salt, feature)``.
+#:
+#: The n-grams of a code corpus overlap heavily -- ``"ret"``, ``"urn"`` and
+#: ``"exec"`` recur across most documents -- so this cache converts a large
+#: fraction of the SHA-256 calls into dictionary lookups. The bound keeps a
+#: streaming workload from growing it without limit; on the shipped fixture
+#: corpus it saturates well below the cap.
+_FEATURE_HASH_CACHE: dict[tuple[str, str], tuple[int, float]] = {}
+_FEATURE_HASH_CACHE_CAPACITY = 1 << 16
+
+
 def _feature_hash(feature: str, salt: str) -> tuple[int, float]:
     """Map a feature to ``(bucket, sign)`` deterministically.
 
@@ -150,10 +165,17 @@ def _feature_hash(feature: str, salt: str) -> tuple[int, float]:
     process by PYTHONHASHSEED, which would make the projection -- and therefore
     every retrieval number -- differ between runs.
     """
+    key = (salt, feature)
+    cached = _FEATURE_HASH_CACHE.get(key)
+    if cached is not None:
+        return cached
     digest = hashlib.sha256(f"{salt}:{feature}".encode("utf-8")).digest()
     bucket = int.from_bytes(digest[:4], "big") % EMBEDDING_DIM
     sign = 1.0 if digest[4] & 1 else -1.0
-    return bucket, sign
+    result = (bucket, sign)
+    if len(_FEATURE_HASH_CACHE) < _FEATURE_HASH_CACHE_CAPACITY:
+        _FEATURE_HASH_CACHE[key] = result
+    return result
 
 
 class DeterministicSubwordEncoder:
@@ -177,11 +199,18 @@ class DeterministicSubwordEncoder:
                 self._anchor_lookup[phrase.lower()] = anchor
 
     def anchor_for(self, text: str) -> str | None:
-        """The semantic anchor a piece of text matches, if any."""
+        """The semantic anchor a piece of text matches, if any.
+
+        The punctuation-stripped form is computed once rather than once per
+        phrase. Doing it inside the loop cost fifty regex substitutions per
+        call, which made it the single most expensive step of inference even
+        though the result does not depend on the phrase.
+        """
         lowered = text.lower()
+        spaced = _NON_ALNUM_RE.sub(" ", lowered)
         best: tuple[int, str] | None = None
         for phrase, anchor in self._anchor_lookup.items():
-            if phrase in lowered or phrase in re.sub(r"[^a-z0-9]", " ", lowered):
+            if phrase in lowered or phrase in spaced:
                 if best is None or len(phrase) > best[0]:
                     best = (len(phrase), anchor)
         return best[1] if best else None

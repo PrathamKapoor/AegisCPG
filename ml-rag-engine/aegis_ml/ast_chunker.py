@@ -65,6 +65,15 @@ SUPPORTED_LANGUAGES = ("python", "javascript", "typescript", "rust")
 
 
 def _ts_language(language: str):  # pragma: no cover - thin adapter
+    """Resolve one supported name to a `tree_sitter.Language`.
+
+    Each `tree_sitter_*` package exposes a zero-argument `language()` factory
+    that returns a `PyCapsule`; the mapping therefore stores the *factory*, not
+    a `Language`, and the factory must be called. Passing the function object
+    straight to `Language()` raises `TypeError: an integer is required`, which
+    is what the first version did -- so every grammar lookup failed and the
+    module fell back to line heuristics for every language.
+    """
     if not _TS_AVAILABLE:
         raise RuntimeError("tree-sitter language bindings are unavailable")
     mapping = {
@@ -75,7 +84,7 @@ def _ts_language(language: str):  # pragma: no cover - thin adapter
     }
     if language not in mapping:
         raise ValueError(f"unsupported language '{language}'")
-    return Language(mapping[language])
+    return Language(mapping[language]())
 
 
 def tree_sitter_available() -> bool:
@@ -429,7 +438,7 @@ class AstChunker:
                 )
             )
 
-        chunks.extend(self._module_chunk(source, lines))
+        chunks.extend(self._module_chunk(source, lines, chunks))
         chunks.sort(key=lambda c: (c.start_line, c.end_line))
         return chunks
 
@@ -483,35 +492,51 @@ class AstChunker:
                 flush(i)
         flush(len(lines))
 
-        chunks.extend(self._module_chunk(source, lines))
+        chunks.extend(self._module_chunk(source, lines, chunks))
         chunks.sort(key=lambda c: (c.start_line, c.end_line))
         return chunks
 
     # -- shared -------------------------------------------------------------
 
-    def _module_chunk(self, source: str, lines: list[str]) -> list[AstCodeChunk]:
-        """A chunk covering module-level code outside every function."""
-        covered: set[int] = set()
-        # Recompute function extents from the emitted chunks is not possible here,
-        # so the module chunk is emitted only when module-level sink code exists.
-        module_sinks = detect_sink_indicators(source)
-        if not module_sinks:
+    def _module_chunk(self, source: str, lines: list[str], existing: list[AstCodeChunk]) -> list[AstCodeChunk]:
+        """A chunk covering module-level code that no function chunk covers.
+
+        The gaps are computed from the already-emitted function chunks rather
+        than spanning lines 1..200 unconditionally. A module chunk that covers
+        the whole file overlaps every function in it, so the same source appears
+        under two ids and every recall figure computed over the corpus counts
+        each finding twice.
+        """
+        if not detect_sink_indicators(source):
             return []
-        # Bound the module chunk so it cannot dominate the index.
-        head = "\n".join(lines[:200])
-        if not detect_sink_indicators(head):
-            return []
-        return [
-            self._build_chunk(
-                chunk_id=f"{self.server_id}:{self.language}:module",
-                symbol_name="<module>",
-                start_line=1,
-                end_line=min(len(lines), 200),
-                body=head,
-                node=None,
-                lines=lines,
+
+        covered = sorted((c.start_line, c.end_line) for c in existing)
+        gaps: list[tuple[int, int]] = []
+        cursor = 1
+        for start, end in covered:
+            if start > cursor:
+                gaps.append((cursor, start - 1))
+            cursor = max(cursor, end + 1)
+        if cursor <= len(lines):
+            gaps.append((cursor, len(lines)))
+
+        out: list[AstCodeChunk] = []
+        for index, (start, end) in enumerate(gaps):
+            body = "\n".join(lines[start - 1 : end])
+            if not detect_sink_indicators(body):
+                continue
+            out.append(
+                self._build_chunk(
+                    chunk_id=f"{self.server_id}:{self.language}:module{index if len(gaps) > 1 else ''}",
+                    symbol_name="<module>",
+                    start_line=start,
+                    end_line=end,
+                    body=body,
+                    node=None,
+                    lines=lines,
+                )
             )
-        ]
+        return out
 
     def _build_chunk(
         self,
