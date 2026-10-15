@@ -27,7 +27,9 @@ it. None is transcribed by hand.
 
 Measured on **Windows 11 on ARM64 (Qualcomm Snapdragon, `ARM64`)**, Python
 3.12.10, rustc 1.99.0, against the 14 shipped fixtures and 51 compositional
-chains. Full output: `benchmarks/results/summary_metrics.json`, `aegis_benchmarks.duckdb`, `aegis_benchmarks.parquet`.
+chains. Full output: `benchmarks/results/summary_metrics.json`,
+`aegis_benchmarks.duckdb`, `aegis_benchmarks.parquet`, plus the Phase 8 tables
+`aegis_tla_checks.parquet` and `aegis_ebpf_equivalence.parquet`.
 
 | Metric | Measured | Source |
 |---|---|---|
@@ -36,6 +38,8 @@ chains. Full output: `benchmarks/results/summary_metrics.json`, `aegis_benchmark
 | **DTG compression** | 94.92 % – 99.35 % (2037 raw nodes → 45 retained) | same |
 | **Compositional block rate** | **36 / 36** malicious chains, 15 / 15 legitimate allowed | lattice arithmetic + MILP |
 | **Max counterexample depth** | 4 hops | constructive witness traces |
+| **TLA+ model checking** | **486** states, zero violations, under the reference monitor; **1134** states clean on the safe config; **4 / 4** guard-removal mutations caught; corrupted `.cfg` refused | `aegis-cli check-tla` + `--suite tla` |
+| **eBPF decision equivalence** | 24 / 24 verdicts agree across the C hooks, the Rust simulator and the RFC 9669 VM; **5 / 5** fail-open mutations caught | `cargo test -p aegis-ebpf-loader` + `--suite ebpf` |
 | **Divergence separation** | benign max **0.0010**, malicious min **0.7361**, margin **0.7351** | ONNX Runtime |
 | **RAG ablation (nDCG@10)** | hybrid **0.6375** vs dense-only **0.5255**, 5/5 queries improved | hybrid + BM25 + RRF + 3-hop propagation |
 | **Scoring latency** | 2.80 ms min / 6.26 ms median end to end | 200 repetitions per stage |
@@ -121,13 +125,13 @@ TACR no longer matches; the grant is revoked.
 
 ```
 C:\Pratham\AegisCPG\
-├── crates/                       Rust control plane — 233 tests, zero warnings
+├── crates/                       Rust control plane — 403 tests, zero warnings
 │   ├── aegis-common/             lattice, TACR, canonical hashing, ES256
 │   ├── aegis-dtg-parser/         Stage 1: lex, structure, taint, compress
-│   ├── aegis-smt-verifier/       Stage 3: product automaton, counterexamples
-│   ├── aegis-ebpf-loader/        Stage 4: TACR → cgroup policy, ringbuf decode
-│   ├── aegis-proxy-gateway/      inline edit automaton, taint, WebAuthn
-│   ├── aegis-cli/                scan / verify / audit-and-enforce
+│   ├── aegis-smt-verifier/       Stage 3: product automaton, native TLA+ checker
+│   ├── aegis-ebpf-loader/        Stage 4: TACR → cgroup policy, RFC 9669 VM
+│   ├── aegis-proxy-gateway/      edit automaton, FIDO2, OAuth/PASETO, Cypher, portal
+│   ├── aegis-cli/                scan / verify / check-tla / audit-and-enforce
 │   └── aegis-desktop-core/       mcp.json discovery + idempotent wrapping
 ├── ml-rag-engine/                Python control plane — 82 tests
 │   ├── aegis_ml/
@@ -140,12 +144,12 @@ C:\Pratham\AegisCPG\
 │   └── tests/
 ├── workflows/                    durable declassification state machine
 ├── benchmarks/                   harness, fixtures, measured results
-├── apps/                         web portal, desktop firewall, mobile approver
+├── apps/                         web portal view models, desktop firewall binary, mobile approver
 ├── specs/                        TLA+, SMT-LIB, JSON Schema, protobuf
-├── ebpf-probes/                  LSM enforcer BPF program
+├── ebpf-probes/                  LSM enforcer BPF program + native userspace shim
 ├── .toolchain/                   portable Rust/Python/Git, all contained
 ├── flow.md                       architecture and dataflow
-└── decisions.md                  ADR-001 … ADR-018 and a 12-bug post-mortem
+└── decisions.md                  ADR-001 … ADR-022 and a 12-bug post-mortem
 ```
 
 ---
@@ -169,12 +173,13 @@ node --test "apps/web-portal/tests/*.test.mjs"
 
 # 5. See the tool work end to end
 .\target\debug\aegis-cli.exe scan --path benchmarks\fixtures\vulnerable-lab
+.\target\debug\aegis-cli.exe check-tla --spec specs\MCPShieldLTS.tla --config specs\MCPShieldLTS.safe.cfg
 .\target\debug\aegis-cli.exe audit-and-enforce --repo benchmarks\fixtures\vulnerable-lab
 
 # 6. Re-measure every number in this README
 .\.toolchain\python\python.exe benchmarks\run_all_benchmarks.py
 
-# 7. Confirm all twelve Hard-Rule gates in one command
+# 7. Confirm all thirteen Hard-Rule gates in one command
 .\.toolchain\python\python.exe scripts\final_audit.py
 ```
 
@@ -237,13 +242,13 @@ The full list, with how each was found, is in `decisions.md` under *Post-mortem*
 
 | Suite | Command | Count |
 |---|---|---|
-| Rust control plane | `cargo test --workspace` | **233** |
+| Rust control plane | `cargo test --workspace` | **403** |
 | Python control plane | `pytest ml-rag-engine/tests` | **82** |
 | Web portal view models | `node --test apps/web-portal/tests` | **18** |
-| Hard-Rule audit | `python scripts/final_audit.py` | 12 gates |
-| Benchmark thresholds | `run_all_benchmarks.py` | 8 assertions |
+| Hard-Rule audit | `python scripts/final_audit.py` | 13 gates |
+| Benchmark thresholds | `run_all_benchmarks.py` | 16 assertions |
 
-All 333 tests and all 12 gates pass on this host.
+All 503 tests and all 13 gates pass on this host.
 
 ---
 
@@ -251,26 +256,37 @@ All 333 tests and all 12 gates pass on this host.
 
 Stated rather than implied:
 
-* **The Tauri desktop shell** (`apps/desktop-firewall`) cannot be compiled on
-  this air-gapped host — `tauri` is not vendored and the registry is
-  unreachable. All of its logic lives in `crates/aegis-desktop-core`, which *is*
-  a workspace member with 11 tests; the shell is a translation of those calls.
+* **Kernel BPF loading.** The LSM program is compiled, executed, and verified
+  natively on this host -- the freestanding userspace shim runs the real hooks,
+  the RFC 9669 verifier/VM executes assembly encodings of them, all 24 scenario
+  verdicts must agree across the C, the Rust simulator and the VM, and 5/5
+  fail-open mutations must be caught (`--suite ebpf`) -- but loading into a
+  kernel needs Linux 5.7+ with `CONFIG_BPF_LSM`, which this host does not have.
+  On other hosts the edit automaton and a seccomp filter apply, and the reduced
+  guarantee is reported as such (ADR-004).
+* **TLC.** The shipped specification is checked by the native model checker
+  (`aegis-cli check-tla`: 486 states clean under the reference monitor, 1134 on
+  the safe config, 4/4 guard-removal mutations caught, corrupted configurations
+  refused -- ADR-020/021). TLC itself is not run: there is no JVM on this host,
+  which is exactly why the checker exists. It implements the TLA+ subset this
+  module uses, not all of TLA+.
+* **The Tauri webview** (`apps/desktop-firewall/gui`) is not compiled -- `tauri`
+  is not vendored and the registry is unreachable. Everything security-relevant
+  does compile: the logic in `crates/aegis-desktop-core` and the
+  `aegis-desktop-firewall` workspace binary that drives it, both built and
+  tested in the main workspace and by the audit's binaries gate. The GUI is a
+  thin view over those calls, excluded via its own `[workspace]`.
 * **The Flutter mobile approver** has no Dart SDK on this host, so it is not
   compiled or tested. Its `policy.dart` is pure Dart with no Flutter import and
   implements the same state machine `workflows/` implements in Python, which is
-  tested.
-* **The Next.js components** need `npm install`, which this host cannot do. Their
-  entire transformation layer is in `src/lib/aegis.mjs`, which is tested against
-  the real artefacts the Rust and Python suites produced.
-* **The eBPF program** (`ebpf-probes/lsm_enforcer.bpf.c`) requires Linux 5.7+ with
-  `CONFIG_BPF_LSM`; the layout is cross-checked against the Rust decoder by
-  `bpf_layout.rs`, but the program has not been loaded into a kernel here. On
-  other hosts the edit automaton and a seccomp filter apply, and the reduced
-  guarantee is reported as such (ADR-004).
-* **The TLA+ specification** in `specs/MCPShieldLTS.tla` has not been run through
-  TLC here — no model checker is installed. Its rules are cross-checked
-  structurally by `test_spec_artifacts.py`, and the same properties are asserted
-  directly against the Rust solver.
+  tested. The operationally supported approver here is the gateway's embedded
+  FIDO2 PWA at `/mobile`, exercised live over TCP by
+  `crates/aegis-proxy-gateway/tests/portal.rs`.
+* **The Next.js page components** need `npm install`, which this host cannot do.
+  Their entire transformation layer is in `src/lib/aegis.mjs`, tested against
+  the real artefacts the Rust and Python suites produced. The live 3D command
+  center is the equivalent embedded, dependency-free page served by the gateway
+  at `GET /`, tested in the same live suite.
 
 ---
 

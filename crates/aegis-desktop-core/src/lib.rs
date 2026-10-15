@@ -1,12 +1,15 @@
-//! AegisCPG desktop firewall core: find and wrap local stdio MCP servers.
+//! AegisCPG desktop firewall core: find, wrap, restore and verify local stdio
+//! MCP servers.
 //!
 //! **Author:** Pratham Kapoor `<prathamkapoor027@gmail.com>`
 //! **Repository:** <https://github.com/PrathamKapoor>
 //!
 //! ## WHAT
-//! Discovery of `mcp.json` files under a user's home directory, and an
-//! idempotent rewrite of their `command` field so the stdio server runs inside
-//! `aegis-proxy-gateway` instead of unmediated.
+//! Discovery of `mcp.json` files under a user's home directory, an idempotent
+//! rewrite of their `command` field so the stdio server runs inside
+//! `aegis-proxy-gateway` instead of unmediated, and a SHA-256-verified backup
+//! of the original so the rewrite is reversible *and* the reversal is checked
+//! rather than trusted.
 //!
 //! ## WHY THE LOGIC IS HERE AND NOT IN THE TAURI SHELL
 //! The shell (`apps/desktop-firewall`) cannot be compiled on this host: the Tauri
@@ -34,8 +37,14 @@
 //! Discovery reads three fixed paths and returns every stdio entry. Wrapping
 //! rewrites the `command` field of each and writes the document back, or
 //! returns [`WrapOutcome::AlreadyWrapped`] and leaves the file byte-identical.
-//! [`LsmStatus::probe`] reads the loader's report when one exists and says so
-//! plainly when it does not.
+//! The backup-aware path ([`wrap_stdio_servers_with_backup`]) additionally
+//! records the pre-wrap bytes and their SHA-256 in sidecar files beside the
+//! configuration; [`unwrap_stdio_servers`] refuses to restore unless both the
+//! backup hash and the current file hash still match what was recorded, so a
+//! tampered backup or a hand-edited configuration is reported instead of being
+//! clobbered. [`verify_config`] reduces the same checks to one verdict for a
+//! CI gate. [`LsmStatus::probe`] reads the loader's report when one exists and
+//! says so plainly when it does not.
 //!
 //! A worked example, for the shape the shell passes in:
 //!
@@ -48,6 +57,7 @@
 //! Complexity: discovery is O(entries in the three candidate directories);
 //! wrapping is O(size of one JSON document).
 
+use aegis_common::crypto::sha256_hex;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -264,6 +274,441 @@ pub fn tray_model(home: &Path, repo_root: &Path) -> Vec<(String, bool)> {
     items
 }
 
+// ---------------------------------------------------------------------
+// Verified backup, restore, and the verify-config verdict
+// ---------------------------------------------------------------------
+
+/// The suffix of the sidecar that holds the pre-wrap bytes.
+pub const BACKUP_SUFFIX: &str = ".aegis-backup";
+
+/// The suffix of the manifest that pins the backup's SHA-256.
+pub const MANIFEST_SUFFIX: &str = ".aegis-backup.json";
+
+/// Builds `<path><suffix>`, so the sidecar names are defined once.
+fn suffixed(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// The `(backup, manifest)` sidecar paths for a configuration file.
+pub fn backup_paths(config_path: &Path) -> (PathBuf, PathBuf) {
+    (
+        suffixed(config_path, BACKUP_SUFFIX),
+        suffixed(config_path, MANIFEST_SUFFIX),
+    )
+}
+
+/// What a wrap recorded, so that restore is *verified* rather than trusted.
+///
+/// Both hashes live in the same document: the original's so a tampered backup
+/// is detected before it is written back, the wrapped state's so a
+/// hand-edited configuration is detected before it is clobbered. No
+/// timestamp: the record describes content, and content is what the checks
+/// compare.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BackupManifest {
+    /// SHA-256 of the configuration file *before* the wrap.
+    pub original_sha256: String,
+    /// SHA-256 of the configuration file *after* the wrap.
+    pub wrapped_sha256: String,
+    /// How many server entries the wrap rewrote.
+    pub servers_wrapped: usize,
+    /// The backup's file name, recorded so a manifest moved next to a
+    /// different configuration is detectable.
+    pub backup_file: String,
+}
+
+/// What [`wrap_stdio_servers_with_backup`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackupWrapOutcome {
+    /// The file was rewritten and the pre-wrap bytes were recorded beside it.
+    Wrapped { servers: usize, backup: PathBuf },
+    /// Every entry was already wrapped and the file still matches the recorded
+    /// wrapped state; nothing was written.
+    AlreadyWrapped,
+    /// Every entry is wrapped but no backup was ever recorded. The wrap
+    /// refuses to fabricate one: a backup of already-wrapped bytes would
+    /// restore to the wrapped state and call it the original, which is
+    /// exactly the lie this sidecar exists to prevent.
+    AlreadyWrappedWithoutBackup,
+    /// No stdio server entry with a `command` field exists.
+    NothingToWrap,
+    /// The file or its backup changed since the recorded wrap (or the
+    /// sidecars are unreadable); nothing was written.
+    Refused(String),
+    /// The file could not be read or parsed.
+    Unreadable,
+}
+
+/// Wraps every stdio server in `config_path` and records a verifiable backup.
+///
+/// Refuses in both directions rather than being helpful: it will not overwrite
+/// a backup whose hash no longer matches, and it will not wrap a file that
+/// drifted from its recorded wrapped state. Either refusal leaves every byte
+/// on disk untouched.
+pub fn wrap_stdio_servers_with_backup(
+    config_path: &Path,
+    interpreter: &str,
+    repo_root: &Path,
+) -> BackupWrapOutcome {
+    let (backup_path, manifest_path) = backup_paths(config_path);
+
+    let Ok(original) = fs::read_to_string(config_path) else {
+        return BackupWrapOutcome::Unreadable;
+    };
+    let Ok(document) = serde_json::from_str::<Value>(&original) else {
+        return BackupWrapOutcome::Unreadable;
+    };
+    let Some(servers) = document.get("mcpServers").and_then(Value::as_object) else {
+        return BackupWrapOutcome::Unreadable;
+    };
+    let commands: Vec<&str> = servers
+        .values()
+        .filter_map(|description| description.get("command").and_then(Value::as_str))
+        .collect();
+    if commands.is_empty() {
+        return BackupWrapOutcome::NothingToWrap;
+    }
+
+    if manifest_path.exists() {
+        let Ok(manifest_text) = fs::read_to_string(&manifest_path) else {
+            return BackupWrapOutcome::Refused(
+                "the backup manifest exists but cannot be read".to_string(),
+            );
+        };
+        let Ok(manifest) = serde_json::from_str::<BackupManifest>(&manifest_text) else {
+            return BackupWrapOutcome::Refused("the backup manifest is not valid JSON".to_string());
+        };
+        let Ok(backup_bytes) = fs::read(&backup_path) else {
+            return BackupWrapOutcome::Refused(
+                "the backup file named by the manifest is missing".to_string(),
+            );
+        };
+        let backup_hash = sha256_hex(&backup_bytes);
+        if backup_hash != manifest.original_sha256 {
+            return BackupWrapOutcome::Refused(format!(
+                "the backup does not match its recorded SHA-256 (recorded {}, found {backup_hash})",
+                manifest.original_sha256
+            ));
+        }
+        let current_hash = sha256_hex(original.as_bytes());
+        if current_hash != manifest.wrapped_sha256 {
+            return BackupWrapOutcome::Refused(format!(
+                "the configuration changed since it was wrapped (recorded {}, found {current_hash}); \
+                 unwrap it, or remove the .aegis-backup sidecars, before wrapping again",
+                manifest.wrapped_sha256
+            ));
+        }
+        return BackupWrapOutcome::AlreadyWrapped;
+    }
+
+    if commands
+        .iter()
+        .all(|command| command.contains(WRAPPER_MARKER))
+    {
+        return BackupWrapOutcome::AlreadyWrappedWithoutBackup;
+    }
+
+    let servers_wrapped = match wrap_stdio_servers(config_path, interpreter, repo_root) {
+        WrapOutcome::Wrapped(count) => count,
+        WrapOutcome::AlreadyWrapped => return BackupWrapOutcome::AlreadyWrappedWithoutBackup,
+        WrapOutcome::Unreadable => return BackupWrapOutcome::Unreadable,
+    };
+
+    let Ok(wrapped_text) = fs::read_to_string(config_path) else {
+        return BackupWrapOutcome::Refused(
+            "the file was wrapped but could not be read back to record its state".to_string(),
+        );
+    };
+    if fs::write(&backup_path, original.as_bytes()).is_err() {
+        return BackupWrapOutcome::Refused(
+            "the file was wrapped but the backup could not be written; unwrap it by hand before \
+             wrapping again"
+                .to_string(),
+        );
+    }
+    let manifest = BackupManifest {
+        original_sha256: sha256_hex(original.as_bytes()),
+        wrapped_sha256: sha256_hex(wrapped_text.as_bytes()),
+        servers_wrapped,
+        backup_file: backup_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string(),
+    };
+    match serde_json::to_string_pretty(&manifest) {
+        Ok(text) => {
+            if fs::write(&manifest_path, text).is_err() {
+                return BackupWrapOutcome::Refused(
+                    "the file was wrapped and backed up but the manifest could not be written"
+                        .to_string(),
+                );
+            }
+        }
+        Err(_) => {
+            return BackupWrapOutcome::Refused("the manifest could not be serialised".to_string())
+        }
+    }
+
+    BackupWrapOutcome::Wrapped {
+        servers: servers_wrapped,
+        backup: backup_path,
+    }
+}
+
+/// What [`unwrap_stdio_servers`] did.
+///
+/// Every refusal variant documents which check failed; the function writes
+/// nothing on any of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnwrapOutcome {
+    /// The pre-wrap bytes were restored and both sidecars removed.
+    Restored,
+    /// No manifest exists for this configuration.
+    NoBackup,
+    /// The backup's SHA-256 does not match the manifest.
+    BackupCorrupt { expected: String, found: String },
+    /// The configuration no longer matches the state the wrap recorded, so
+    /// restoring would discard whatever changed it.
+    ModifiedSinceWrap { expected: String, found: String },
+    /// A sidecar exists but cannot be read, parsed, or does not describe this
+    /// configuration.
+    Unreadable,
+}
+
+/// Restores the pre-wrap bytes, but only if both hashes still agree.
+pub fn unwrap_stdio_servers(config_path: &Path) -> UnwrapOutcome {
+    let (backup_path, manifest_path) = backup_paths(config_path);
+    if !manifest_path.exists() {
+        return UnwrapOutcome::NoBackup;
+    }
+
+    let Ok(manifest_text) = fs::read_to_string(&manifest_path) else {
+        return UnwrapOutcome::Unreadable;
+    };
+    let Ok(manifest) = serde_json::from_str::<BackupManifest>(&manifest_text) else {
+        return UnwrapOutcome::Unreadable;
+    };
+    let expected_name = backup_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if manifest.backup_file != expected_name {
+        return UnwrapOutcome::Unreadable;
+    }
+
+    let Ok(backup_bytes) = fs::read(&backup_path) else {
+        return UnwrapOutcome::Unreadable;
+    };
+    let found_backup = sha256_hex(&backup_bytes);
+    if found_backup != manifest.original_sha256 {
+        return UnwrapOutcome::BackupCorrupt {
+            expected: manifest.original_sha256,
+            found: found_backup,
+        };
+    }
+
+    let Ok(current) = fs::read(config_path) else {
+        return UnwrapOutcome::Unreadable;
+    };
+    let found_current = sha256_hex(&current);
+    if found_current != manifest.wrapped_sha256 {
+        return UnwrapOutcome::ModifiedSinceWrap {
+            expected: manifest.wrapped_sha256,
+            found: found_current,
+        };
+    }
+
+    if fs::write(config_path, &backup_bytes).is_err() {
+        return UnwrapOutcome::Unreadable;
+    }
+    let _ = fs::remove_file(&backup_path);
+    let _ = fs::remove_file(&manifest_path);
+    UnwrapOutcome::Restored
+}
+
+/// The one-line verdict [`verify_config`] reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConfigVerdict {
+    /// Every entry runs under the gateway, the backup matches its recorded
+    /// SHA-256, and the file is byte-identical to the recorded wrapped state.
+    Protected,
+    /// No server entry runs under the gateway.
+    Unprotected,
+    /// Some entries run under the gateway and some do not.
+    PartiallyWrapped,
+    /// Every entry runs under the gateway, but no backup was recorded, so the
+    /// rewrite cannot be reversed automatically.
+    Unbacked,
+    /// The file, its manifest, or its backup no longer agrees with the
+    /// recorded state.
+    Diverged,
+    /// The backup exists but fails its own SHA-256 check.
+    Broken,
+    /// The configuration is not valid JSON, or has no `mcpServers` object.
+    Invalid,
+    /// The configuration path does not exist.
+    Missing,
+    /// The configuration has no stdio server entries; nothing to protect.
+    Empty,
+}
+
+/// The full report behind the verdict.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ConfigVerification {
+    pub config_path: String,
+    pub verdict: ConfigVerdict,
+    pub servers: usize,
+    pub wrapped_servers: usize,
+    pub backup_present: bool,
+    /// Whether the backup matches the manifest's SHA-256, when a manifest
+    /// exists and could be read.
+    pub backup_intact: Option<bool>,
+    /// Whether the configuration still matches the recorded wrapped state.
+    pub in_recorded_state: Option<bool>,
+    pub note: String,
+}
+
+impl ConfigVerification {
+    /// Whether the configuration is protected (or has nothing to protect).
+    pub fn is_protected(&self) -> bool {
+        matches!(self.verdict, ConfigVerdict::Protected | ConfigVerdict::Empty)
+    }
+}
+
+/// Evaluates one configuration against its recorded state, without writing
+/// anything.
+pub fn verify_config(config_path: &Path) -> ConfigVerification {
+    let (backup_path, manifest_path) = backup_paths(config_path);
+    let mut report = ConfigVerification {
+        config_path: config_path.display().to_string(),
+        verdict: ConfigVerdict::Missing,
+        servers: 0,
+        wrapped_servers: 0,
+        backup_present: backup_path.exists(),
+        backup_intact: None,
+        in_recorded_state: None,
+        note: String::new(),
+    };
+
+    let Ok(text) = fs::read_to_string(config_path) else {
+        report.note = "the configuration does not exist or cannot be read".to_string();
+        return report;
+    };
+    let document: Value = match serde_json::from_str(&text) {
+        Ok(document) => document,
+        Err(error) => {
+            report.verdict = ConfigVerdict::Invalid;
+            report.note = format!("not valid JSON: {error}");
+            return report;
+        }
+    };
+    let Some(servers) = document.get("mcpServers").and_then(Value::as_object) else {
+        report.verdict = ConfigVerdict::Invalid;
+        report.note = "no mcpServers object".to_string();
+        return report;
+    };
+    let commands: Vec<&str> = servers
+        .values()
+        .filter_map(|description| description.get("command").and_then(Value::as_str))
+        .collect();
+    report.servers = commands.len();
+    report.wrapped_servers = commands
+        .iter()
+        .filter(|command| command.contains(WRAPPER_MARKER))
+        .count();
+
+    if commands.is_empty() {
+        report.verdict = ConfigVerdict::Empty;
+        report.note = "no stdio server entries with a command field; nothing to protect".to_string();
+        return report;
+    }
+
+    if !manifest_path.exists() {
+        report.verdict = if report.wrapped_servers == 0 {
+            ConfigVerdict::Unprotected
+        } else if report.wrapped_servers == report.servers {
+            ConfigVerdict::Unbacked
+        } else {
+            ConfigVerdict::PartiallyWrapped
+        };
+        report.note = match report.verdict {
+            ConfigVerdict::Unprotected => "no server entry runs under the gateway".to_string(),
+            ConfigVerdict::Unbacked => "every entry is wrapped but no backup was recorded; \
+                                        restoring the original would have to be done by hand"
+                .to_string(),
+            _ => format!(
+                "{}/{} entries run under the gateway",
+                report.wrapped_servers, report.servers
+            ),
+        };
+        return report;
+    }
+
+    let manifest = fs::read_to_string(&manifest_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<BackupManifest>(&text).ok());
+    let Some(manifest) = manifest else {
+        report.verdict = ConfigVerdict::Diverged;
+        report.note = "a backup manifest exists but cannot be read or parsed".to_string();
+        return report;
+    };
+
+    match fs::read(&backup_path) {
+        Ok(bytes) => {
+            let found = sha256_hex(&bytes);
+            report.backup_intact = Some(found == manifest.original_sha256);
+            if found != manifest.original_sha256 {
+                report.verdict = ConfigVerdict::Broken;
+                report.note = format!(
+                    "the backup's SHA-256 is {found}, the manifest records {}; restore would be \
+                     refused",
+                    manifest.original_sha256
+                );
+                return report;
+            }
+        }
+        Err(_) => {
+            report.backup_intact = Some(false);
+            report.verdict = ConfigVerdict::Diverged;
+            report.note = "the manifest names a backup that does not exist".to_string();
+            return report;
+        }
+    }
+
+    let current = sha256_hex(text.as_bytes());
+    report.in_recorded_state = Some(current == manifest.wrapped_sha256);
+    if current != manifest.wrapped_sha256 {
+        report.verdict = ConfigVerdict::Diverged;
+        report.note = format!(
+            "the configuration's SHA-256 is {current}, the recorded wrapped state is {}; restore \
+             would be refused so nothing is clobbered",
+            manifest.wrapped_sha256
+        );
+        return report;
+    }
+
+    if report.wrapped_servers != report.servers {
+        // Unreachable while the hash matches, but the JSON walk is the part an
+        // operator can see; report the weaker verdict rather than the hash.
+        report.verdict = ConfigVerdict::PartiallyWrapped;
+        report.note = format!(
+            "{}/{} entries run under the gateway although the file matches its recorded state",
+            report.wrapped_servers, report.servers
+        );
+        return report;
+    }
+
+    report.verdict = ConfigVerdict::Protected;
+    report.note = "every entry runs under the gateway and the backup matches its recorded \
+                   SHA-256"
+        .to_string();
+    report
+}
+
 /// Re-exported so the shell can construct the `serde_json::Map` it needs.
 pub type JsonMap = Map<String, Value>;
 
@@ -456,5 +901,217 @@ mod tests {
         assert!(paths[0].ends_with(".claude/mcp.json") || paths[0].ends_with(r".claude\mcp.json"));
         assert!(paths[1].to_string_lossy().contains("cursor"));
         assert!(paths[2].to_string_lossy().contains("vscode"));
+    }
+
+    // -----------------------------------------------------------------
+    // Verified backup, restore, and verify-config
+    // -----------------------------------------------------------------
+
+    fn wrap_with_backup(path: &Path) -> BackupWrapOutcome {
+        wrap_stdio_servers_with_backup(path, "python", Path::new("/opt/aegis"))
+    }
+
+    #[test]
+    fn wrap_records_a_verifiable_backup_and_unwrap_restores_byte_for_byte() {
+        let path = scratch("mcp-backup.json");
+        fs::write(&path, SAMPLE).unwrap();
+        let original = fs::read_to_string(&path).unwrap();
+
+        let BackupWrapOutcome::Wrapped { servers, backup } = wrap_with_backup(&path) else {
+            panic!("expected a wrap");
+        };
+        assert_eq!(servers, 2);
+        assert!(backup.exists(), "the backup must be on disk");
+
+        let (backup_path, manifest_path) = backup_paths(&path);
+        let manifest: BackupManifest =
+            serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.original_sha256, sha256_hex(original.as_bytes()));
+        assert_eq!(manifest.servers_wrapped, 2);
+        let wrapped = fs::read_to_string(&path).unwrap();
+        assert_eq!(manifest.wrapped_sha256, sha256_hex(wrapped.as_bytes()));
+        assert_ne!(original, wrapped, "the wrap must have changed the file");
+
+        assert_eq!(unwrap_stdio_servers(&path), UnwrapOutcome::Restored);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            original,
+            "restore must be byte-identical"
+        );
+        assert!(
+            !backup_path.exists() && !manifest_path.exists(),
+            "a completed restore removes both sidecars"
+        );
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_tampered_backup_is_refused_and_the_wrapped_config_is_left_alone() {
+        let path = scratch("mcp-tamper.json");
+        fs::write(&path, SAMPLE).unwrap();
+        assert!(matches!(wrap_with_backup(&path), BackupWrapOutcome::Wrapped { .. }));
+        let wrapped_bytes = fs::read(&path).unwrap();
+
+        let (backup_path, _) = backup_paths(&path);
+        fs::write(&backup_path, "{ tampered").unwrap();
+
+        match unwrap_stdio_servers(&path) {
+            UnwrapOutcome::BackupCorrupt { expected, found } => assert_ne!(expected, found),
+            other => panic!("expected BackupCorrupt, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            wrapped_bytes,
+            "a refused unwrap must write nothing"
+        );
+        assert_eq!(verify_config(&path).verdict, ConfigVerdict::Broken);
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_modified_config_is_not_clobbered_by_restore() {
+        let path = scratch("mcp-modified.json");
+        fs::write(&path, SAMPLE).unwrap();
+        assert!(matches!(wrap_with_backup(&path), BackupWrapOutcome::Wrapped { .. }));
+
+        // The operator hand-edits the wrapped file -- say, adds a server.
+        let mut edited = fs::read_to_string(&path).unwrap();
+        edited.push('\n');
+        fs::write(&path, &edited).unwrap();
+
+        match unwrap_stdio_servers(&path) {
+            UnwrapOutcome::ModifiedSinceWrap { expected, found } => assert_ne!(expected, found),
+            other => panic!("expected ModifiedSinceWrap, got {other:?}"),
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), edited);
+        assert_eq!(verify_config(&path).verdict, ConfigVerdict::Diverged);
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn wrapping_again_after_a_verified_wrap_is_a_no_op() {
+        let path = scratch("mcp-rewrap.json");
+        fs::write(&path, SAMPLE).unwrap();
+        assert!(matches!(wrap_with_backup(&path), BackupWrapOutcome::Wrapped { .. }));
+        let after_first = fs::read(&path).unwrap();
+        let (backup_path, manifest_path) = backup_paths(&path);
+        let backup_after_first = fs::read(&backup_path).unwrap();
+        let manifest_after_first = fs::read_to_string(&manifest_path).unwrap();
+
+        assert_eq!(wrap_with_backup(&path), BackupWrapOutcome::AlreadyWrapped);
+        assert_eq!(fs::read(&path).unwrap(), after_first);
+        assert_eq!(fs::read(&backup_path).unwrap(), backup_after_first);
+        assert_eq!(
+            fs::read_to_string(&manifest_path).unwrap(),
+            manifest_after_first
+        );
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn unwrap_without_a_backup_reports_no_backup_and_writes_nothing() {
+        let path = scratch("mcp-nobackup.json");
+        fs::write(&path, SAMPLE).unwrap();
+        assert_eq!(unwrap_stdio_servers(&path), UnwrapOutcome::NoBackup);
+        assert_eq!(fs::read_to_string(&path).unwrap(), SAMPLE);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_prewrapped_file_without_a_backup_is_not_given_a_fabricated_one() {
+        let path = scratch("mcp-prewrapped.json");
+        let mut document: Value = serde_json::from_str(SAMPLE).unwrap();
+        {
+            let servers = document["mcpServers"].as_object_mut().unwrap();
+            for description in servers.values_mut() {
+                if let Some(command) = description.get("command").and_then(Value::as_str) {
+                    let command = command.to_string();
+                    description["command"] = Value::String(wrapped_command(
+                        "python",
+                        Path::new("/opt/aegis"),
+                        &command,
+                    ));
+                }
+            }
+        }
+        fs::write(&path, serde_json::to_string_pretty(&document).unwrap()).unwrap();
+
+        assert_eq!(
+            wrap_with_backup(&path),
+            BackupWrapOutcome::AlreadyWrappedWithoutBackup
+        );
+        let (backup_path, _) = backup_paths(&path);
+        assert!(
+            !backup_path.exists(),
+            "a backup of already-wrapped bytes would record the wrapped state as the original"
+        );
+        assert_eq!(verify_config(&path).verdict, ConfigVerdict::Unbacked);
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn verify_config_distinguishes_every_state() {
+        let file = scratch("verify-states");
+        let dir = file.parent().unwrap().to_path_buf();
+
+        // Missing: the path is not there at all.
+        assert_eq!(
+            verify_config(&dir.join("absent.json")).verdict,
+            ConfigVerdict::Missing
+        );
+
+        // Unprotected: parseable, no entry wrapped.
+        let plain = dir.join("plain.json");
+        fs::write(&plain, SAMPLE).unwrap();
+        let report = verify_config(&plain);
+        assert_eq!(report.verdict, ConfigVerdict::Unprotected);
+        assert_eq!(report.servers, 2);
+        assert_eq!(report.wrapped_servers, 0);
+        assert!(!report.is_protected());
+
+        // Invalid: not JSON.
+        let invalid = dir.join("invalid.json");
+        fs::write(&invalid, "{ not json").unwrap();
+        assert_eq!(verify_config(&invalid).verdict, ConfigVerdict::Invalid);
+
+        // Empty: no stdio entries, so nothing to protect.
+        let empty = dir.join("empty.json");
+        fs::write(&empty, r#"{"mcpServers": {"s": {"args": []}}}"#).unwrap();
+        let report = verify_config(&empty);
+        assert_eq!(report.verdict, ConfigVerdict::Empty);
+        assert!(report.is_protected());
+
+        // Protected: wrapped, and both hashes still agree.
+        let protected = dir.join("protected.json");
+        fs::write(&protected, SAMPLE).unwrap();
+        assert!(matches!(wrap_with_backup(&protected), BackupWrapOutcome::Wrapped { .. }));
+        let report = verify_config(&protected);
+        assert_eq!(report.verdict, ConfigVerdict::Protected);
+        assert!(report.is_protected());
+        assert!(report.backup_present);
+        assert_eq!(report.backup_intact, Some(true));
+        assert_eq!(report.in_recorded_state, Some(true));
+
+        // Partially wrapped: one command is ours, one is not.
+        let partial = dir.join("partial.json");
+        let mut document: Value = serde_json::from_str(SAMPLE).unwrap();
+        document["mcpServers"]["filesystem"]["command"] = Value::String(wrapped_command(
+            "python",
+            Path::new("/opt/aegis"),
+            "python",
+        ));
+        fs::write(&partial, serde_json::to_string_pretty(&document).unwrap()).unwrap();
+        let report = verify_config(&partial);
+        assert_eq!(report.verdict, ConfigVerdict::PartiallyWrapped);
+        assert_eq!(report.servers, 2);
+        assert_eq!(report.wrapped_servers, 1);
+        assert!(!report.is_protected());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

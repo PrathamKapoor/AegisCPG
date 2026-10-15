@@ -1,0 +1,55 @@
+# AegisCPG desktop firewall -- Tauri v2 application shell (GUI).
+#
+# Author: Pratham Kapoor <prathamkapoor027@gmail.com>
+# https://github.com/PrathamKapoor
+#
+# WHAT:  The tray window. Every action it offers calls the same
+#        `crates/aegis-desktop-core` functions the native
+#        `apps/desktop-firewall` CLI calls -- this shell adds the tray icon,
+#        not the logic.
+# WHY:   Electron's ~180 MB idle footprint and garbage-collection pauses are
+#        unacceptable for a process that lives in the notification area for
+#        weeks. Tauri's shell uses the host WebView and its Rust side has no
+#        garbage collector at all (ADR-014).
+# HOW:   This package is NOT a workspace member: the `tauri` crate is not
+#        vendored on this air-gapped host, so it cannot be built or tested
+#        here. The engine behind it -- discovery, wrapping, SHA-256 verified
+#        restore -- lives in `crates/aegis-desktop-core` (a member, with
+#        tests) and is driven natively by the `aegis-desktop-firewall`
+#        workspace binary in the parent directory. That is stated rather than
+#        hidden: see `src/main.rs`'s module header.
+
+[package]
+name = "aegis-desktop-firewall-gui"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+description = "AegisCPG desktop firewall tray shell (Tauri v2 front-end for the aegis-desktop-core engine)."
+authors = ["Pratham Kapoor <prathamkapoor027@gmail.com>"]
+repository = "https://github.com/PrathamKapoor/AegisCPG"
+keywords = ["security", "mcp", "ebpf", "desktop", "firewall"]
+categories = ["gui", "security"]
+
+# Deliberately its own workspace: see HOW above.
+[workspace]
+
+[dependencies]
+aegis-desktop-core = { path = "../../../crates/aegis-desktop-core", version = "1.0.0" }
+tauri = { version = "2.0", features = ["tray-icon"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+
+# Release profile pinned to keep the shipped binary small enough to sit in a
+# tray for weeks. `panic = "abort"` is deliberate: a panic in a tray process
+# would take the tray with it, and the operator would lose the one surface they
+# use to find out their servers are unprotected.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

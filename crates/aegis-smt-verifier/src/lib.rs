@@ -27,6 +27,9 @@
 //! solver is total over its fragment.
 
 pub mod smt_encoder;
+pub mod tla_eval;
+pub mod tla_model_checker;
+pub mod tla_parser;
 pub mod verifier;
 
 pub use smt_encoder::{

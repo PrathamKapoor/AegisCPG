@@ -650,7 +650,7 @@ bypass by a malicious server requesting a signature.
 | RSA-2048 | Rejected — 8× slower verify, no advantage at this scale |
 | TOTP / SMS codes | Rejected — not phishing-resistant; TV13 survives |
 | Symmetric HMAC on TACRs | Rejected — no third-party verifiability |
-| **ECDSA P-256 + PASETO v4.local + WebAuthn/FIDO2** | **Adopted** |
+| **ECDSA P-256 + PASETO v3.public + WebAuthn/FIDO2** | **Adopted** (the token profile was later corrected from the originally planned `v4.local`; see ADR-022) |
 
 ### Decision Outcome
 
@@ -663,7 +663,8 @@ bypass by a malicious server requesting a signature.
   must **strictly increase** per credential (TV22); `userVerification = required`
   and `residentKey = required` (TV13 — the assertion is bound to a hardware key
   that the malicious server cannot present).
-- **Identity**: Ory/Keycloak OIDC Authorization Code + PKCE; tokens PASETO v4.
+- **Identity**: Ory/Keycloak OIDC Authorization Code + PKCE; tokens PASETO
+  v3.public over the same ES256 key as the TACR (ADR-022).
 
 ### What Initially Went Wrong
 
@@ -771,10 +772,18 @@ must be isolated from the workstation.
   with WebGL instanced rendering, D3-force for layout in a Web Worker, TanStack Query
   for transport and TanStack Table with virtualization for telemetry.
 - **Desktop**: Tauri v2 (system WebView, Rust backend) — **< 35 MB RSS** while
-  wrapping local stdio MCP servers; native tray commands `discover_local_mcp_configs`,
-  `wrap_stdio_server`, `get_kernel_lsm_status`.
+  wrapping local stdio MCP servers. The tray surface is `aegis-desktop-core`
+  (`discover`, `wrap`, `unwrap`, `verify_config`) plus the
+  `aegis-desktop-firewall` workspace binary that drives it from a terminal;
+  the Tauri webview in `apps/desktop-firewall/gui` is a thin excluded shell
+  over those functions (its own `[workspace]`, see the README's coverage
+  notes), so everything security-relevant compiles and is integration-tested
+  in the main workspace.
 - **Mobile**: Flutter, isolated biometric approval; renders the lattice transition
-  SECRET → PUBLIC and produces the ECDSA P-256 assertion.
+  SECRET → PUBLIC and produces the ECDSA P-256 assertion. The operationally
+  supported path in this repository is the equivalent FIDO2 PWA served by the
+  gateway at `/mobile`, which is exercised live over TCP by
+  `crates/aegis-proxy-gateway/tests/portal.rs`.
 
 ### What Initially Went Wrong
 
@@ -1426,3 +1435,188 @@ correctly.
 * `test_rag_milp_workflow.py::test_both_dense_paths_are_reported` keeps its name
   and its assertion: the path is reported, and it is one of the two documented
   values. The second can no longer occur, which the test does not require.
+
+---
+
+## ADR-020 - The TLA+ specification is checked by a native model checker, not TLC on a JVM
+
+**Status.** Accepted
+**Date.** 2026-10-15
+
+### Context
+
+`specs/MCPShieldLTS.tla` was written to be checked but never *was*: the HOW
+sections said to run TLC with `java -cp tla2tools.jar`, and this air-gapped
+Windows ARM64 host has no JVM and no vendored jar. The cost showed up exactly as
+the "static artifact" failure mode: three latent defects (an unreachable action
+pair, an unbound variable, a malformed `TypeOK` clause) survived a whole
+development cycle because nothing ever evaluated the file. A specification that
+cannot run in the environment that develops it is documentation, not a proof
+obligation.
+
+### Considered Alternatives
+
+| Option | Verdict |
+|---|---|
+| TLC (`tla2tools.jar` + JVM) | Rejected -- no JVM present, none vendored; the audit forbids un-vendored downloads |
+| Apalache | Rejected -- same JVM dependency, plus a Scala toolchain |
+| Keep the spec static, verify by review | Rejected -- that is the status quo that hid three defects |
+| **Native parser + BFS model checker over the TLA+ subset this module uses** | **Adopted** |
+
+### Decision Outcome
+
+`crates/aegis-smt-verifier/src/{tla_parser,tla_eval,tla_model_checker}.rs`
+implement module parsing (CONSTANTS, VARIABLES, operator definitions, `Init`,
+`Next`), TLC-style `.cfg` parsing (`INVARIANTS`, constant bindings), structural
+successor enumeration, invariant evaluation over every reachable state, and
+minimal counterexample reconstruction from parent pointers.
+`aegis-cli check-tla` is the public surface: `--mode enforced|as-configured`,
+`--mutation <id>`, `--expect clean|violations`, `--min-states`, `--json`; the
+exit code is the gate (`0` iff the expectation held).
+
+### Why
+
+1. **The gate runs wherever the workspace runs.** No JVM, no network, no jar.
+2. **The checker cross-validates the configuration.** A `.cfg` invariant with no
+   matching operator is `TlaError::UndefinedInvariant` *before* checking --
+   fail closed, not a silently ignored name.
+3. **One module, both models.** `GuardMode::Enforced` overrides
+   `GatewayEnforced := TRUE` without editing the file, so the same module proves
+   the vulnerability (unprotected `.cfg`, as configured) and the fix (safe
+   `.cfg`, and the unprotected file under the reference monitor).
+4. **Negative gates are first-class.** Four guard-removal mutations each strip
+   one security property's implementation; each must produce a witness naming
+   exactly that property.
+
+### Consequences
+
+* Measured by `benchmarks/run_all_benchmarks.py --suite tla`:
+  `MCPShieldLTS.cfg` under the enforced monitor reaches **486 states, zero
+  violations**; `MCPShieldLTS.safe.cfg` is clean in both modes (**1134 states**);
+  the unprotected file as configured exposes a violation witness; **4/4**
+  mutations are caught, each against its named invariant; a corrupted `.cfg` is
+  refused before checking.
+* The accepted TLA+ subset is the subset this module uses (finite-set
+  quantifiers, tuples, records, functions, sequences, arithmetic). It is not a
+  general TLA+ implementation and does not claim to be; the README's coverage
+  notes say so.
+
+---
+
+## ADR-021 - The state space is quotiented by trace-independence, and executing the spec repaired five defects
+
+**Status.** Accepted
+**Date.** 2026-10-15
+
+### Context
+
+The model carries a `traceLog` that grows on every transition. A breadth-first
+search keyed on the *whole* state never terminates: the same structural state
+reached along a 7-entry trace and a 8-entry trace are different keys, so the
+search walks an infinite tree. TLC usually handles this with a depth directive;
+a checker whose termination argument is "a `--max-states` flag" proves nothing.
+
+### Decision
+
+The visited set (and therefore the bisimulation quotient) is keyed on the state
+*without* `traceLog`. Trace entries are a function of the transition's parameter
+binding, so two paths that reach the same structural state carry interchangeable
+history for every property the `.cfg` checks -- the invariants quantify only
+over the other six variables.
+
+### Why
+
+1. **Termination is structural, not a budget.** The quotient is finite because
+   every `.cfg` domain is finite; BFS terminates exactly. `--max-states` remains
+   a tripwire, not the termination argument.
+2. **Witness minimality is a theorem, not a heuristic.** BFS order plus the
+   quotient means the first violation reported is a shortest counterexample.
+3. **Nothing checked is quotiented away.** If a future invariant reads
+   `traceLog`, the quotient argument is void for it, and the argument has to be
+   re-made -- which is why this is written down instead of being a comment.
+
+### Consequences -- the five repairs executing the file forced (R1--R5 in the spec header)
+
+* **R1** -- `Init` left `grantedCapabilities` empty and no action ever granted
+  one, so `InvokeToolRead`/`InvokeToolWrite` were unreachable in *every*
+  configuration: the two actions the capsule properties quantify over were dead
+  code. Fixed by loading the signed-TACR constant `ToolGrants` in `Init`.
+* **R2** -- `Next` referenced an unbound `d` in the write disjunct. Fixed to
+  `\E d \in BOOLEAN`.
+* **R3** -- `TypeOK`'s `traceLog` clause constrained each entry against a
+  7-element set; entries are 6-tuples. The clause now uses the actual entry
+  product, and the two misaligned entries were normalised.
+* **R4** -- `GatewayEnforced` guarded only mutation and declassification, so the
+  "protected" model still leaked SECRET data through unguarded reads and writes.
+  The read/write clearance guards the gateway implements are now in the model.
+  (This is the same bug class the gateway's fail-closed session table guards
+  against at runtime.)
+* **R5** -- `ContextIsolationInvariant` as written was violated by any two
+  servers that had both learned *genuinely shareable* PUBLIC data, i.e. it was
+  false by construction. It now bounds shared knowledge by the clearance the two
+  servers have in common.
+
+Each repair is the model catching an implementation-side bug class: unreachable
+checkers (R1), unbound variables (R2), shape drift in audit records (R3), guards
+covering fewer actions than the deployment believes (R4), and invariants that
+are vacuous or false by construction (R5).
+
+---
+
+## ADR-022 - PASETO v3.public for OAuth tokens (amends ADR-012's v4.local line)
+
+**Status.** Accepted (amends ADR-012)
+**Date.** 2026-10-15
+
+### Context
+
+ADR-012's alternatives table named "PASETO v4.local" as part of the adopted
+option. The Phase 8 identity workstream implemented the token layer, and two
+corrections to that cell became unavoidable:
+
+1. **`v4` is the Ed25519 profile.** The system's asymmetric identity is ECDSA
+   P-256: the TACR is ES256, WebAuthn credentials are ES256. ADR-012 chose P-256
+   *over* Ed25519 for HSM/SM2-region hardware parity. `v4.public` would add a
+   second curve, a second verification path, and a hand-rolled Ed25519
+   implementation -- new cryptography, for zero gain at this scale.
+2. **`.local` is symmetric.** A `.local` token can only be verified by a
+   holder of the minting secret, which contradicts ADR-012's own argument for
+   public-key TACRs ("verification is public-key only, so a third party can
+   verify without being able to mint"). A capability token a downstream MCP
+   server cannot verify without being able to forge it is the wrong shape.
+
+### Decision
+
+OAuth access tokens are **PASETO v3.public**: four segments, no footer, signed
+with the same ES256 machinery as the TACR (`sign_prehash` /
+`verify_es256_prehash` over the v3 pre-authentication encoding). Claims:
+`iss`, `sub` (the OAuth client), `aud`, `iat`, `nbf`, `exp`, `scope`, `jti`.
+Validation order is header -> base64url encoding -> signature -> claims; each
+failure class maps to its own error rather than one generic "invalid token".
+`/oauth/token` issues; `/oauth/keys` publishes the key id and SEC1 point so a
+verifier needs no shared secret. The signing key comes from
+`AEGIS_PASETO_SEED` (32 bytes, hex): absent -> an ephemeral development key,
+present-but-blank or malformed -> the gateway refuses to start, because a token
+issuer with a deterministic fallback key is a vulnerability, not a convenience.
+
+### Why not v4.local exactly as ADR-012 wrote it
+
+* **One key type.** P-256 everywhere; PASERK `k3.public` and ES256 share the
+  tested code path in `aegis-common::crypto`.
+* **Third-party verifiability.** A resource server can verify a grant without
+  holding the power to mint one -- the same property the TACR design rests on.
+* **No new cryptography.** v3 reuses the verified ES256 implementation; v4
+  would have introduced a new signing algorithm into the security core.
+
+### Consequences
+
+* ADR-012's table cell is amended in place with a pointer here; its `.local`
+  wording is superseded.
+* The OAuth server is authorization-code + PKCE only, `S256` required;
+  `redirect_uri` must match exactly (a mismatch is `invalid_request`, not
+  `invalid_grant`), and an authorization code is consumed on the *first* redeem
+  attempt whether or not the exchange succeeds -- replay fails closed. The RFC
+  7636 Appendix B vector is pinned in a test.
+* The PASETO module is tested against every confusion class it exists to make
+  impossible: tampered payload, tampered signature, wrong version header,
+  expired `exp`, wrong `aud`, wrong `iss`.

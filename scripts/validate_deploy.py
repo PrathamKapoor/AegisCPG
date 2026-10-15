@@ -39,7 +39,7 @@ PUBSPEC = REPO_ROOT / "apps" / "mobile-approver" / "pubspec.yaml"
 JSON_MANIFESTS = (
     REPO_ROOT / "apps" / "web-portal" / "package.json",
     REPO_ROOT / "apps" / "web-portal" / "next.config.json",
-    REPO_ROOT / "apps" / "desktop-firewall" / "tauri.conf.json",
+    REPO_ROOT / "apps" / "desktop-firewall" / "gui" / "tauri.conf.json",
     REPO_ROOT / "specs" / "tacr.schema.json",
     REPO_ROOT / "benchmarks" / "fixtures" / "mcptox_chains" / "exfil_chains.json",
     REPO_ROOT / "benchmarks" / "results" / "summary_metrics.json",

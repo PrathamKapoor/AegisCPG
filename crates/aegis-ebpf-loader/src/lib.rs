@@ -23,9 +23,15 @@
 //! sections, not `syscall_trace`.
 //!
 //! ## HOW
-//! * [`policy_compiler`] -- TACR to cgroup hash entry, LPM trie keys, exec
-//!   digest allowlist and CIDR list; plus [`KernelLsmSimulator`], the reference
-//!   implementation of the same decision table so the tests run on any host.
+//! * [`policy_compiler`] -- TACR to cgroup hash entry, LPM trie keys, the
+//!   verified-exec inode registry and CIDR list; plus [`KernelLsmSimulator`],
+//!   the reference implementation of the same decision table so the tests run
+//!   on any host.
+//! * [`bpf_vm`] -- the RFC 9669 instruction set: an assembler for the BPF
+//!   assembly the decision table is written in, a verifier, and a VM that
+//!   executes it, so the same decisions exist in three independently executed
+//!   forms (C, Rust, BPF) that `tests/shim_equivalence.rs` compares case by
+//!   case.
 //! * [`ringbuf_reader`] -- decodes `struct aegis_kernel_event` and renders CEF
 //!   and Prometheus output.
 //!
@@ -33,8 +39,10 @@
 //! transmission: 0 bytes exfiltrated.
 
 pub mod bpf_layout;
+pub mod bpf_vm;
 pub mod policy_compiler;
 pub mod ringbuf_reader;
+pub mod toolchain;
 
 pub use policy_compiler::{
     cidr_contains, compile, normalise_path, CgroupPolicyEntry, CompileError, HookType,

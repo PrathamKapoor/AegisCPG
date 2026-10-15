@@ -1,53 +1,39 @@
-# AegisCPG desktop firewall -- Tauri v2 application shell.
+# AegisCPG desktop firewall -- native CLI engine.
 #
 # Author: Pratham Kapoor <prathamkapoor027@gmail.com>
 # https://github.com/PrathamKapoor
 #
-# WHAT:  A tray application that finds the operator's stdio MCP server
-#        configurations and wraps them so they run inside aegis-proxy-gateway.
-# WHY:   Electron's ~180 MB idle footprint and garbage-collection pauses are
-#        unacceptable for a process that lives in the notification area for
-#        weeks. Tauri's shell uses the host WebView and its Rust side has no
-#        garbage collector at all (ADR-014).
-# HOW:   All logic lives in `crates/aegis-desktop-core`, which is a workspace
-#        member with eleven tests. This crate is a thin translation of those
-#        calls into Tauri commands and is excluded from the workspace because
-#        the `tauri` crate cannot be fetched on this air-gapped host. That is
-#        stated rather than hidden: see `src/main.rs`'s module header.
+# WHAT:  `aegis-desktop-firewall.exe`, the engine of the desktop firewall:
+#        discover | wrap | unwrap | verify-config | status. The Tauri tray in
+#        `gui/` is a front-end for exactly these operations.
+# WHY:   The `tauri` crate cannot be fetched on this air-gapped host, so the
+#        tray shell (gui/) cannot be built here. The wrap rewrite, the
+#        SHA-256-verified restore and the verification verdict are the parts
+#        that can be wrong, so they live in a plain workspace binary that is
+#        compiled, executed and tested on this host; the shell adds the tray
+#        icon, not the logic.
+# HOW:   No argument-parsing dependency, key=value output, meaningful exit
+#        codes (0 clean, 1 refused/not verified, 2 usage error) so
+#        `verify-config` is usable as a CI gate. All decisions delegate to
+#        `crates/aegis-desktop-core`, which carries the unit tests.
 
 [package]
 name = "aegis-desktop-firewall"
-version = "1.0.0"
-edition = "2021"
-rust-version = "1.82"
-license = "Apache-2.0"
-description = "AegisCPG native desktop stdio MCP server wrapper and firewall."
-authors = ["Pratham Kapoor <prathamkapoor027@gmail.com>"]
-repository = "https://github.com/PrathamKapoor/AegisCPG"
-keywords = ["security", "mcp", "ebpf", "desktop", "firewall"]
-categories = ["gui", "security"]
+description = "AegisCPG native desktop stdio MCP server firewall: wrap servers through the gateway with SHA-256 verified restore."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
-# Deliberately its own workspace. Listing it in the root manifest would make
-# `cargo test --workspace` fail for every contributor because `tauri` is not
-# vendored here.
-[workspace]
+[[bin]]
+name = "aegis-desktop-firewall"
+path = "src/main.rs"
 
 [dependencies]
-aegis-desktop-core = { path = "../../crates/aegis-desktop-core", version = "1.0.0" }
-tauri = { version = "2.0", features = ["tray-icon"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-
-[build-dependencies]
-tauri-build = { version = "2.0", features = [] }
-
-# Release profile pinned to keep the shipped binary small enough to sit in a
-# tray for weeks. `panic = "abort"` is deliberate: a panic in a tray process
-# would take the tray with it, and the operator would lose the one surface they
-# use to find out their servers are unprotected.
-[profile.release]
-opt-level = "s"
-lto = true
-codegen-units = 1
-panic = "abort"
-strip = true
+aegis-desktop-core.workspace = true
+serde_json.workspace = true

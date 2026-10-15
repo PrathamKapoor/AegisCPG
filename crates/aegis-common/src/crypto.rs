@@ -35,7 +35,7 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 
 /// Errors produced by the cryptographic layer.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CryptoError {
     /// A signature did not verify against the supplied public key.
     SignatureInvalid,
@@ -369,6 +369,36 @@ pub fn public_key_hex(&self) -> String {
     pub fn sign(&self, message: &[u8]) -> Result<String, CryptoError> {
         self.sign_digest(&Sha256::digest(message))
     }
+
+    /// Signs a pre-computed digest **without hashing it again**.
+    ///
+    /// This is deliberately a different operation from [`Self::sign_digest`].
+    /// `sign_digest` routes through the `Signer` trait, which hashes its input
+    /// with the curve's own digest first: `sign_digest(Sha256(m))` signs
+    /// `SHA-256(SHA-256(m))`. That is internally consistent with
+    /// [`verify_es256_digest`] and is what the TACR and WebAuthn paths rely on,
+    /// but it cannot express "ECDSA over a digest computed with a *different*
+    /// hash". PASETO v3.public is exactly that: its signature is ECDSA P-256
+    /// over `SHA-384(PAE(header, payload, footer))`. Signing that through
+    /// `sign_digest` would add a second SHA-256 pass and produce tokens no
+    /// spec-conforming verifier accepts. This method signs the bytes as given.
+    ///
+    /// Deterministic per RFC 6979. The nonce-derivation HMAC uses the curve's
+    /// default digest (SHA-256) rather than SHA-384; that affects only
+    /// bit-for-bit reproduction of the PASETO specification's *signing* vectors
+    /// -- verification depends on the ECDSA relation, not on how `k` was
+    /// derived, and `k` derived by `ecdsa` is a valid RFC 6979 stream for the
+    /// key and message.
+    pub fn sign_prehash(&self, prehash: &[u8]) -> Result<String, CryptoError> {
+        use p256::ecdsa::signature::hazmat::PrehashSigner;
+        let signature: Signature = PrehashSigner::sign_prehash(&self.inner, prehash).map_err(|e| {
+            CryptoError::MalformedEncoding(format!("prehash signing failed: {e}"))
+        })?;
+        let bytes = signature.to_bytes();
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+        Ok(URL_SAFE_NO_PAD.encode(&bytes))
+    }
 }
 
 /// Verifies a detached ES256 signature.
@@ -433,6 +463,44 @@ pub fn verify_es256_digest(
 
     verifying_key
         .verify(digest, &signature)
+        .map_err(|_| CryptoError::SignatureInvalid)
+}
+
+/// Verifies an ECDSA P-256 signature over a pre-computed digest, hashing nothing.
+///
+/// The counterpart of [`AegisSigningKey::sign_prehash`]. Note the distinction
+/// from [`verify_es256_digest`], whose name is historical: that function routes
+/// through the `Verifier` trait and hashes its argument with SHA-256 first, so
+/// it verifies what `sign_digest` produced, not raw prehash signatures. This
+/// function treats its argument as the digest itself, which is what PASETO
+/// v3.public's SHA-384 PAE signature requires.
+pub fn verify_es256_prehash(
+    prehash: &[u8],
+    signature_b64: &str,
+    public_key_hex: &str,
+) -> Result<(), CryptoError> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    use p256::ecdsa::signature::hazmat::PrehashVerifier;
+
+    let sig_bytes = URL_SAFE_NO_PAD
+        .decode(signature_b64.trim())
+        .map_err(|e| CryptoError::MalformedEncoding(format!("signature base64: {e}")))?;
+    if sig_bytes.len() != 64 {
+        return Err(CryptoError::MalformedEncoding(format!(
+            "ES256 signature must be 64 raw bytes, got {}",
+            sig_bytes.len()
+        )));
+    }
+    let signature = Signature::from_slice(&sig_bytes)
+        .map_err(|e| CryptoError::MalformedEncoding(format!("signature: {e}")))?;
+
+    let key_bytes = hex::decode(public_key_hex.trim())
+        .map_err(|e| CryptoError::MalformedEncoding(format!("public key hex: {e}")))?;
+    let verifying_key = VerifyingKey::from_sec1_bytes(&key_bytes)
+        .map_err(|e| CryptoError::InvalidKey(e.to_string()))?;
+
+    PrehashVerifier::verify_prehash(&verifying_key, prehash, &signature)
         .map_err(|_| CryptoError::SignatureInvalid)
 }
 
@@ -664,5 +732,53 @@ mod tests {
         let sig = key.sign_digest(&digest).unwrap();
         verify_es256_digest(&digest, &sig, &key.public_key_hex()).unwrap();
         verify_es256(msg, &sig, &key.public_key_hex()).unwrap();
+    }
+
+    #[test]
+    fn prehash_signatures_round_trip_with_sha384() {
+        use sha2::Sha384;
+        let key = AegisSigningKey::from_seed(&[13u8; 32]).expect("valid P-256 scalar");
+        // The PASETO v3 shape: ECDSA P-256 over SHA-384 of the PAE encoding.
+        let digest = Sha384::digest(b"v3.public.pae-bytes");
+        let sig = key.sign_prehash(&digest).unwrap();
+        verify_es256_prehash(&digest, &sig, &key.public_key_hex()).unwrap();
+    }
+
+    #[test]
+    fn prehash_and_digest_signing_are_distinct_operations() {
+        use sha2::Sha384;
+        let key = AegisSigningKey::from_seed(&[17u8; 32]).expect("valid P-256 scalar");
+        let prehash = Sha384::digest(b"payload");
+
+        // sign_prehash signs exactly these 48 bytes...
+        let sig = key.sign_prehash(&prehash).unwrap();
+        verify_es256_prehash(&prehash, &sig, &key.public_key_hex()).unwrap();
+        // ...so a verifier that hashes the argument again (verify_es256_digest)
+        // must reject it. If this ever passes, one of the two functions quietly
+        // changed its hashing contract.
+        assert!(
+            verify_es256_digest(&prehash, &sig, &key.public_key_hex()).is_err(),
+            "verify_es256_digest must hash its argument; sign_prehash must not"
+        );
+
+        // And the converse: sign_digest output verifies under verify_es256_digest
+        // but not under the raw-prehash verifier.
+        let via_digest = key.sign_digest(&prehash).unwrap();
+        assert!(verify_es256_prehash(&prehash, &via_digest, &key.public_key_hex()).is_err());
+    }
+
+    #[test]
+    fn prehash_signatures_are_deterministic_and_key_bound() {
+        use sha2::Sha384;
+        let a = AegisSigningKey::from_seed(&[19u8; 32]).expect("valid P-256 scalar");
+        let b = AegisSigningKey::from_seed(&[23u8; 32]).expect("valid P-256 scalar");
+        let digest = Sha384::digest(b"determinism");
+        let first = a.sign_prehash(&digest).unwrap();
+        let second = a.sign_prehash(&digest).unwrap();
+        assert_eq!(first, second, "RFC 6979 deterministic nonces expected");
+        assert!(verify_es256_prehash(&digest, &first, &b.public_key_hex()).is_err());
+        assert!(verify_es256_prehash(&digest, "not-base64!!", &a.public_key_hex()).is_err());
+        assert!(verify_es256_prehash(&digest, "AAAA", &a.public_key_hex()).is_err());
+        assert!(verify_es256_prehash(&digest, &first, "nothex").is_err());
     }
 }

@@ -304,11 +304,16 @@ def test_tla_defines_all_four_safety_invariants() -> None:
 def test_tla_every_referenced_operator_is_defined() -> None:
     """Catches the copy/paste class of bug where an action references a name
     that was never defined, which TLC reports as an opaque 'Unknown operator'
-    rather than as a syntax error."""
+    rather than as a syntax error.
+
+    Backslash-prefixed names are excluded: ``\\X`` (the FiniteSets function-set
+    operator) is a builtin by definition, not a module-local operator, and the
+    naive scan would read its ``X`` as an unbound reference.
+    """
     raw = (SPECS / "MCPShieldLTS.tla").read_text(encoding="utf-8")
     text = _strip_tla_comments(raw)
     defined = _tla_operators(raw) | _TLA_KEYWORDS | _TLA_BUILTINS
-    referenced = set(re.findall(r"\b([A-Z][A-Za-z0-9_]*)\s*\(", text))
+    referenced = set(re.findall(r"(?<!\\)\b([A-Z][A-Za-z0-9_]*)\s*\(", text))
     undefined = referenced - defined
     assert not undefined, f"unbound operator references in TLA+: {sorted(undefined)}"
 

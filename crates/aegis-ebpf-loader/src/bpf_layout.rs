@@ -306,7 +306,7 @@ mod tests {
         for map in [
             "cgroup_policy_map",
             "allowed_path_lpm_map",
-            "allowed_exec_hash_map",
+            "allowed_exec_inode_map",
             "allowed_net_map",
             "audit_ringbuf",
         ] {
@@ -317,7 +317,51 @@ mod tests {
         }
         assert!(src.contains("BPF_MAP_TYPE_RINGBUF"), "telemetry needs a ringbuf");
         assert!(src.contains("BPF_MAP_TYPE_LPM_TRIE"), "paths need an LPM trie");
-        assert!(src.contains("BPF_MAP_TYPE_HASH"), "cgroups and exec digests need hash maps");
+        assert!(
+            src.contains("BPF_MAP_TYPE_HASH"),
+            "cgroups and the verified-exec registry need hash maps"
+        );
+    }
+
+    #[test]
+    fn the_exec_hook_enforces_the_verified_inode_registry() {
+        // The kernel cannot hash, so executable identity is enforced by the
+        // registry userspace fills after digest verification; a bprm hook that
+        // stopped consulting it would execute anything with the bit set.
+        let src = bpfsource();
+        let body = hook_body(&src, "lsm/bprm_check_security");
+        assert!(
+            body.contains("allowed_exec_inode_map"),
+            "bprm must consult the verified-exec registry"
+        );
+        assert!(
+            body.contains("f_inode->i_ino"),
+            "the registry key must be the inode the kernel sees"
+        );
+        assert!(
+            body.contains("policy_active(pol)"),
+            "a registry hit must still require an active policy"
+        );
+    }
+
+    #[test]
+    fn the_file_open_hook_enforces_read_and_write_separately() {
+        // Read vs write comes from the open mode: a read-granted tool must not
+        // write, even inside an allowed prefix.
+        let src = bpfsource();
+        let body = hook_body(&src, "lsm/file_open");
+        assert!(
+            body.contains("O_WRONLY") && body.contains("O_RDWR"),
+            "the open mode must select which capability is required"
+        );
+        assert!(
+            body.contains("AEGIS_CAP_FILE_WRITE_BIT") && body.contains("AEGIS_CAP_FILE_READ_BIT"),
+            "both file capabilities must be referenced"
+        );
+        assert!(
+            body.contains("deny_bitmask") && body.contains("allow_bitmask"),
+            "deny must win over allow, as in CgroupPolicyEntry::permits"
+        );
     }
 
     #[test]

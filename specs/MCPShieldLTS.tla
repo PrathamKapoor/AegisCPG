@@ -13,7 +13,10 @@
 (*       for MCP/A2A toolchains but ships heuristic checkers. A formal model  *)
 (*       turns "we think this is safe" into either a proof or an explicit,    *)
 (*       replayable counterexample trace. This module is the reference model  *)
-(*       the Rust verifier (crates/aegis-smt-verifier) must agree with.      *)
+(*       the Rust verifier (crates/aegis-smt-verifier) must agree with, and   *)
+(*       it is executed by two independent engines: the native BFS explorer   *)
+(*       (`aegis-cli check-tla`, see crate docs) and, when a JVM is present,  *)
+(*       TLC via `java -cp tla2tools.jar tlc2.TLC -config ...`.               *)
 (*                                                                            *)
 (* HOW: Explicit finite-state model. Constants supply the lattice labels and   *)
 (*       per-server capabilities; the state variables are the seven named in  *)
@@ -23,13 +26,37 @@
 (*       model (attacks are refused), so the same module proves both the      *)
 (*       vulnerability and the fix.                                           *)
 (*                                                                            *)
-(* Expected TLC behaviour:                                                    *)
+(* SPEC REPAIRS (found by executing this file, see decisions.md ADR-021):     *)
+(*   R1. Init previously left grantedCapabilities empty and no action ever    *)
+(*       granted one, so InvokeToolRead/InvokeToolWrite were unreachable in   *)
+(*       every configuration. The signed-TACR capability set is now the       *)
+(*       constant ToolGrants, loaded by Init.                                 *)
+(*   R2. Next referenced an unbound `d` in the InvokeToolWrite disjunct.      *)
+(*       It is now quantified: \E d \in BOOLEAN.                              *)
+(*   R3. TypeOK's traceLog clause demanded that each ENTRY be an element of a *)
+(*       7-element set; entries are 6-tuples. It now constrains traceLog to   *)
+(*       a sequence over the actual entry product, and the two entries whose  *)
+(*       columns were misaligned (MutateToolDefinition, Fido2Declassify) were *)
+(*       normalised to <<name, agent, server, tool, resource, flag>>.         *)
+(*   R4. GatewayEnforced guarded only mutation and declassification, so the   *)
+(*       "protected" model still leaked SECRET data through unguarded reads   *)
+(*       and writes. The read and write actions now carry the clearance /     *)
+(*       declassification guards that the AegisCPG gateway implements.        *)
+(*   R5. ContextIsolationInvariant as written was violated by any two         *)
+(*       servers that had both learned genuinely shareable PUBLIC data. The   *)
+(*       invariant now bounds the shared knowledge by the clearance the two   *)
+(*       servers have in common: unbridged servers may share only levels that *)
+(*       both are cleared for.                                                *)
+(*                                                                            *)
+(* Expected behaviour, verified natively by `aegis-cli check-tla`:            *)
 (*   - MCPShieldLTS.cfg      (GatewayEnforced = FALSE)                       *)
-(*       TLC MUST report invariant violations; each violating behaviour is a  *)
-(*       concrete attack witness (TV5 rug pull, TV9 context bleed).          *)
+(*       The raw transition relation reaches invariant-violating states;      *)
+(*       each one is a concrete attack witness (TV5 rug pull, TV9 context     *)
+(*       bleed, secret-over-clearance reads).                                 *)
 (*   - MCPShieldLTS.safe.cfg (GatewayEnforced = TRUE)                        *)
-(*       TLC MUST report NO violations. That is the proof that the AegisCPG   *)
-(*       control plane closes exactly those holes.                           *)
+(*       Under the gateway guards, NO reachable state violates any of the     *)
+(*       six invariants. That is the proof that the AegisCPG control plane    *)
+(*       closes exactly those holes and introduces none.                     *)
 (*****************************************************************************)
 EXTENDS Naturals, FiniteSets, Sequences
 
@@ -46,6 +73,7 @@ CONSTANTS
     ToolReads,                    \* [Tools -> SUBSET Resources]
     ToolProduces,                 \* [Tools -> 0..3] level of data returned
     ToolPerms,                    \* [Tools -> SUBSET Tools] declared permissions
+    ToolGrants,                   \* [Agents -> SUBSET Tools] from signed TACRs
     VerifiedDeclassifications     \* SUBSET (Resources \X Servers); those with
                                   \* a hardware-verified FIDO2 assertion
 
@@ -79,13 +107,13 @@ vars == << activeConnections,
           traceLog >>
 
 --------------------------------------------------------------------------------
-(* Sigma_0: quiescent initial state.                                          *)
+(* Sigma_0: quiescent initial state. Capabilities arrive with the TACR.       *)
 (******************************************************************************)
 Init ==
     /\ activeConnections   = {}
     /\ agentKnowledge      = [ a \in Agents |->
                                  [ s \in Servers |-> {} ] ]
-    /\ grantedCapabilities = [ a \in Agents |-> {} ]
+    /\ grantedCapabilities = ToolGrants
     /\ approvedToolHashes  = [ t \in Tools |-> CHOOSE h \in HashValues : TRUE ]
     /\ currentToolHashes   = [ t \in Tools |-> CHOOSE h \in HashValues : TRUE ]
     /\ declassifiedFlows   = {}
@@ -120,12 +148,17 @@ InitializeSession(a, s) ==
                           <<"InitializeSession", a, s, "none", "none", FALSE>>)
 
 (* (2) Agent a invokes read tool t on server s and learns resource r.
-       This is the ONLY way information enters the lattice.                   *)
+       This is the ONLY way information enters the lattice. Under the gateway
+       the read is refused unless the datum is within the server's clearance
+       or the exact (resource, server) pair has been declassified.            *)
 InvokeToolRead(a, s, t, r) ==
     /\ <<a, s>> \in activeConnections
     /\ t \in grantedCapabilities[a]
     /\ ServerOf[t] = s
     /\ r \in ToolReads[t]
+    /\ (GatewayEnforced =>
+          (ResourceLevel[r] <= ServerClearance[s]
+           \/ <<r, s>> \in declassifiedFlows))
     /\ agentKnowledge' =
           [ agentKnowledge EXCEPT ![a][s] = @ \cup {ResourceLevel[r]} ]
     /\ UNCHANGED << activeConnections,
@@ -139,15 +172,22 @@ InvokeToolRead(a, s, t, r) ==
 (* (3) Agent a invokes write tool t on server s carrying resource r.
        Permitted iff  LatticeLevel[r] <= ServerClearance[s]  OR the flow has
        been explicitly declassified. The boolean d marks the call as an
-       attempted declassification.                                             *)
+       attempted declassification. Under the gateway the RE-TAINT also has to
+       be within clearance or declassified: writing through a tool that
+       returns SECRET data into a PUBLIC server is refused.                   *)
 InvokeToolWrite(a, s, t, r, d) ==
     /\ <<a, s>> \in activeConnections
     /\ t \in grantedCapabilities[a]
     /\ ServerOf[t] = s
     /\ r \in ToolReads[t]
     /\ ResourceLevel[r] \in agentKnowledge[a][s]
-    /\ \/ ResourceLevel[r] <= ServerClearance[s]
-       \/ (d /\ <<r, s>> \in declassifiedFlows)
+    /\ (ResourceLevel[r] <= ServerClearance[s]
+        \/ (d /\ <<r, s>> \in declassifiedFlows))
+    /\ (GatewayEnforced =>
+          (ToolProduces[t] <= ServerClearance[s]
+           \/ (\E rk \in Resources :
+                 ResourceLevel[rk] = ToolProduces[t]
+                 /\ <<rk, s>> \in declassifiedFlows)))
     /\ agentKnowledge' =
           [ agentKnowledge EXCEPT ![a][s] = @ \cup {ToolProduces[t]} ]
     /\ UNCHANGED << activeConnections,
@@ -176,7 +216,7 @@ MutateToolDefinition(s, t, newHash) ==
                    approvedToolHashes,
                    declassifiedFlows >>
     /\ traceLog' = Append(traceLog,
-                          <<"MutateToolDefinition", s, t, newHash,
+                          <<"MutateToolDefinition", "none", s, t,
                             "none", FALSE>>)
 
 (* (5) Cross-domain declassification. Unprotected systems let any component
@@ -194,21 +234,24 @@ Fido2Declassify(d, s_target) ==
                    approvedToolHashes,
                    currentToolHashes >>
     /\ traceLog' = Append(traceLog,
-                          <<"Fido2Declassify", "none", s_target, d,
-                            "none", TRUE>>)
+                          <<"Fido2Declassify", "none", s_target, "none",
+                            d, TRUE>>)
 
 --------------------------------------------------------------------------------
 (* -> : the transition relation.                                               *)
 (******************************************************************************)
 Next ==
-    \/ \E a \in Agents, s \in Servers            : InitializeSession(a, s)
+    \/ \E a \in Agents, s \in Servers
+             : InitializeSession(a, s)
     \/ \E a \in Agents, s \in Servers, t \in Tools, r \in Resources
-                                                  : InvokeToolRead(a, s, t, r)
-    \/ \E a \in Agents, s \in Servers, t \in Tools, r \in Resources
-                                                  : InvokeToolWrite(a, s, t, r, d)
-    \/ \E s \in Servers, t \in Tools, h \in HashValues
-                                                  : MutateToolDefinition(s, t, h)
-    \/ \E r \in Resources, s \in Servers          : Fido2Declassify(r, s)
+             : InvokeToolRead(a, s, t, r)
+    \/ \E a \in Agents, s \in Servers, t \in Tools, r \in Resources,
+          d \in BOOLEAN
+             : InvokeToolWrite(a, s, t, r, d)
+    \/ \E s \in Servers, t \in Tools, newHash \in HashValues
+             : MutateToolDefinition(s, t, newHash)
+    \/ \E d \in Resources, s_target \in Servers
+             : Fido2Declassify(d, s_target)
 
 --------------------------------------------------------------------------------
 (* Behaviour: stuttering is permitted so that liveness/fairness reasoning is   *)
@@ -226,12 +269,14 @@ TypeOK ==
     /\ approvedToolHashes  \in [ Tools -> HashValues ]
     /\ currentToolHashes   \in [ Tools -> HashValues ]
     /\ declassifiedFlows   \subseteq (Resources \X Servers)
-    /\ traceLog \in Seq( << "InitializeSession",   Agents \cup {"none"},
-                          Servers \cup {"none"},
-                          Tools \cup {"none"},
-                          Resources \cup {"none"},
-                          HashValues \cup {"none"},
-                          BOOLEAN >> )
+    /\ traceLog \in Seq(
+          {"InitializeSession", "InvokeToolRead", "InvokeToolWrite",
+           "MutateToolDefinition", "Fido2Declassify"}
+          \X (Agents \cup {"none"})
+          \X (Servers \cup {"none"})
+          \X (Tools \cup {"none"})
+          \X (Resources \cup {"none"})
+          \X BOOLEAN)
 
 --------------------------------------------------------------------------------
 (* PROPERTY 1 -- Tool Integrity (MCPShield Property 1).                       *)
@@ -262,30 +307,34 @@ DataConfinementInvariant ==
 (* (every invocation actually performed).                                      *)
 (******************************************************************************)
 PrivilegeBoundednessInvariant ==
-    \A a \in Agents :
-        LET eff == grantedCapabilities[a]
-                   \cap ( UNION { ToolPerms[t] : t \in grantedCapabilities[a] } )
-        IN  /\ eff \subseteq grantedCapabilities[a]
-            /\ \A t \in eff : t \in Tools
+    /\ \A a \in Agents :
+           LET eff == grantedCapabilities[a]
+                      \cap (UNION { ToolPerms[t] : t \in grantedCapabilities[a] })
+           IN  /\ eff \subseteq grantedCapabilities[a]
+               /\ \A t \in eff : t \in Tools
     /\ \A i \in 1..Len(traceLog) :
-          LET step == traceLog[i]
-          IN  /\ (step[1] = "InvokeToolRead" \/ step[1] = "InvokeToolWrite")
-              => /\ step[2] \in Agents
-                 /\ step[4] \in grantedCapabilities[step[2]]
+           LET step == traceLog[i]
+           IN  (step[1] = "InvokeToolRead" \/ step[1] = "InvokeToolWrite")
+                  => (step[2] \in Agents
+                      /\ step[4] \in grantedCapabilities[step[2]])
 
 --------------------------------------------------------------------------------
 (* PROPERTY 4 -- Context Isolation (MCPShield Property 4).                    *)
-(* Unbridged servers share zero knowledge states without an explicit         *)
-(* cross-domain flow policy -- this is the Cross-Server Context Bleed (TV9)   *)
-(* property.                                                                   *)
+(* Unbridged servers share no knowledge beyond the levels both are cleared     *)
+(* for. This is the Cross-Server Context Bleed (TV9) property: two unbridged   *)
+(* domains must never both hold the same datum above the clearance they have   *)
+(* in common. Sharing genuinely public data is not a bleed.                    *)
 (******************************************************************************)
 ContextIsolationInvariant ==
     \A a \in Agents :
       \A s1 \in Servers :
         \A s2 \in Servers :
-            /\ s1 # s2
-            /\ ~Bridged(a, s1, s2)
-            => agentKnowledge[a][s1] \cap agentKnowledge[a][s2] = {}
+            (   /\ s1 # s2
+                /\ ~Bridged(a, s1, s2)
+            ) => agentKnowledge[a][s1] \cap agentKnowledge[a][s2]
+                     \subseteq { l \in SecurityLevels :
+                                    /\ l <= ServerClearance[s1]
+                                    /\ l <= ServerClearance[s2] }
 
 --------------------------------------------------------------------------------
 (* Derived corollary: the session high-water taint mark is the join of every  *)

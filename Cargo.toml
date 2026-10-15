@@ -22,15 +22,25 @@ members = [
     "crates/aegis-proxy-gateway",
     "crates/aegis-cli",
     "crates/aegis-desktop-core",
+    "apps/desktop-firewall",
 ]
 
-# The portable toolchain bootstrap and the Tauri shell are never workspace
-# members. `apps/desktop-firewall` depends on the `tauri` crate, which is not
-# vendored and cannot be fetched on this air-gapped host; listing it here would
-# make `cargo test --workspace` fail for every contributor for the sake of one
-# optional binary. Its logic lives in `crates/aegis-desktop-core`, which is a
-# member and is tested.
-exclude = [".toolchain", "target", "apps"]
+# The portable toolchain bootstrap, the Tauri tray shell, and the non-Rust
+# front-ends are never workspace members. `apps/desktop-firewall/gui` depends
+# on the `tauri` crate, which is not vendored and cannot be fetched on this
+# air-gapped host; listing it would make `cargo test --workspace` fail for
+# every contributor for the sake of one optional binary. The tray's engine --
+# discovery, wrapping, SHA-256-verified restore -- is the workspace member
+# `apps/desktop-firewall` (binary `aegis-desktop-firewall`) plus
+# `crates/aegis-desktop-core`, both of which are built and executed by the
+# test suite on this host.
+exclude = [
+    ".toolchain",
+    "target",
+    "apps/mobile-approver",
+    "apps/web-portal",
+    "apps/desktop-firewall/gui",
+]
 
 [workspace.package]
 version = "1.0.0"
@@ -57,6 +67,7 @@ aegis-dtg-parser = { path = "crates/aegis-dtg-parser", version = "1.0.0" }
 aegis-smt-verifier = { path = "crates/aegis-smt-verifier", version = "1.0.0" }
 aegis-ebpf-loader = { path = "crates/aegis-ebpf-loader", version = "1.0.0" }
 aegis-proxy-gateway = { path = "crates/aegis-proxy-gateway", version = "1.0.0" }
+aegis-desktop-core = { path = "crates/aegis-desktop-core", version = "1.0.0" }
 
 # --- Serialisation ----------------------------------------------------------
 serde = { version = "1.0", features = ["derive"] }
@@ -85,3 +96,11 @@ strip = "debuginfo"
 [profile.dev]
 opt-level = 0
 debug = true
+
+# The TLA+ model checker is an AST interpreter: it walks `Expr` matches and
+# moves `Value` trees ~1.4M times per full exploration. At opt-level 0 that is
+# minutes of pure interpretation overhead in every test run and audit; at
+# opt-level 2 it is seconds. The override is scoped to this one crate so every
+# other crate keeps fully debuggable, symbol-rich dev builds.
+[profile.dev.package.aegis-smt-verifier]
+opt-level = 2

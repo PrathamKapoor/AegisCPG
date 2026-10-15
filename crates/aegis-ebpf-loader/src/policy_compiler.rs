@@ -7,8 +7,8 @@
 //! ## WHAT
 //! Lowers a signed [`TacrContract`] into the concrete maps `lsm_enforcer.bpf.c`
 //! consumes -- a cgroup policy hash, an LPM trie of permitted path prefixes, and
-//! an exec digest allowlist -- and reimplements the identical lookup logic as a
-//! pure-Rust simulator.
+//! an exec inode registry (the digest allowlist's kernel projection) -- and
+//! reimplements the identical lookup logic as a pure-Rust simulator.
 //!
 //! ## WHY
 //! AegisCPG's deployment target is Linux, but its development and CI host is
@@ -118,22 +118,39 @@ impl LpmPrefix {
     /// Compares `prefix_len` bits, so a partial trailing byte is handled
     /// correctly rather than being rounded up to a whole byte.
     pub fn matches(&self, path: &[u8]) -> bool {
+        self.matches_key((path.len() * 8) as u32, path)
+    }
+
+    /// The LPM trie's actual lookup rule: does this stored prefix prefix the
+    /// *key*, whose own significant length is `key_prefix_len` bits?
+    ///
+    /// A stored prefix longer than the key cannot match it. The VM in
+    /// `bpf_vm.rs` performs the same comparison when it emulates the trie, and
+    /// the shim performs it on the C side; all three share this rule by
+    /// construction and agree case by case in `tests/shim_equivalence.rs`.
+    pub fn matches_key(&self, key_prefix_len: u32, key: &[u8]) -> bool {
+        if self.prefix_len > key_prefix_len {
+            return false;
+        }
         if self.prefix_len == 0 {
             return true;
         }
         let full_bytes = (self.prefix_len / 8) as usize;
-        if path.len() < full_bytes || self.data.len() < full_bytes {
+        if key.len() < full_bytes || self.data.len() < full_bytes {
             return false;
         }
-        if path[..full_bytes] != self.data[..full_bytes] {
+        if key[..full_bytes] != self.data[..full_bytes] {
             return false;
         }
         let remainder = self.prefix_len % 8;
         if remainder == 0 {
             return true;
         }
+        if key.len() <= full_bytes || self.data.len() <= full_bytes {
+            return false;
+        }
         let mask = 0xFFu8 << (8 - remainder);
-        path[full_bytes] & mask == self.data[full_bytes] & mask
+        key[full_bytes] & mask == self.data[full_bytes] & mask
     }
 }
 
@@ -160,6 +177,16 @@ pub struct PolicySet {
     pub denied_paths: Vec<LpmPrefix>,
     /// Allowed executable digests.
     pub allowed_exec_sha256: BTreeSet<String>,
+    /// Userspace-verified executables, keyed by inode, mapped to the digest
+    /// that was verified.
+    ///
+    /// This is the kernel's view of the exec allowlist. The kernel cannot hash
+    /// a file inside an LSM hook, so `lsm_enforcer.bpf.c` enforces membership
+    /// of this registry while the simulator above decides by digest; the
+    /// registration step (`register_verified_executable`) refuses a digest the
+    /// contract does not allow, which is what keeps the two views from
+    /// drifting apart into two different allowlists.
+    pub allowed_exec_inodes: BTreeMap<u64, String>,
     /// Permitted egress CIDRs.
     pub allowed_net_cidrs: BTreeSet<String>,
     /// The contract this came from, for provenance in the audit log.
@@ -171,12 +198,22 @@ pub struct PolicySet {
 pub enum CompileError {
     /// The TACR failed validation or signature verification.
     Rejected(TacrError),
+    /// An executable's digest is not on the contract's allowlist, so its inode
+    /// must not enter the verified-executable registry.
+    UnverifiedExecutable {
+        /// The digest that was refused.
+        digest: String,
+    },
 }
 
 impl std::fmt::Display for CompileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CompileError::Rejected(e) => write!(f, "{e}"),
+            CompileError::UnverifiedExecutable { digest } => write!(
+                f,
+                "refusing to register executable: digest {digest} is not on the TACR allowlist"
+            ),
         }
     }
 }
@@ -251,6 +288,7 @@ pub fn compile(tacr: &TacrContract, cgroup_id: u64, sink_kinds: &BTreeSet<SinkKi
             .iter()
             .cloned()
             .collect(),
+        allowed_exec_inodes: BTreeMap::new(),
         allowed_net_cidrs: tacr
             .granted_capabilities
             .allowed_net_cidrs
@@ -259,6 +297,29 @@ pub fn compile(tacr: &TacrContract, cgroup_id: u64, sink_kinds: &BTreeSet<SinkKi
             .collect(),
         tacr_sha256: tacr.body_hash().unwrap_or_default(),
     })
+}
+
+impl PolicySet {
+    /// Registers a userspace-verified executable.
+    ///
+    /// `inode` is what `bprm_check_security` sees in the kernel; the caller
+    /// has already verified `digest` against the contract's
+    /// `allowed_exec_sha256` by reading the file -- the one thing the kernel
+    /// hook cannot do. Registering a digest the contract does not allow is
+    /// refused: without that check the registry could silently become a second
+    /// allowlist that no TACR ever approved.
+    pub fn register_verified_executable(
+        &mut self,
+        inode: u64,
+        digest: &str,
+    ) -> Result<(), CompileError> {
+        let digest = digest.to_ascii_lowercase();
+        if !self.allowed_exec_sha256.contains(&digest) {
+            return Err(CompileError::UnverifiedExecutable { digest });
+        }
+        self.allowed_exec_inodes.insert(inode, digest);
+        Ok(())
+    }
 }
 
 /// The three LSM hooks the enforcer installs.
@@ -946,5 +1007,62 @@ mod tests {
         let a = compile(&c, 3, &sinks).unwrap();
         let b = compile(&c, 3, &sinks).unwrap();
         assert_eq!(a, b, "compilation must be deterministic");
+    }
+
+    #[test]
+    fn the_exec_registry_refuses_digests_the_contract_never_allowed() {
+        // The registry is the kernel's view of the exec allowlist. If any
+        // inode could enter it, it would be a second allowlist that no TACR
+        // approved, and the digest check in the simulator would stop meaning
+        // anything.
+        let caps = GrantedCapabilities {
+            allowed_exec_sha256: vec!["f".repeat(64)],
+            ..Default::default()
+        };
+        let sinks = sink_set_for(&caps);
+        let mut policy = compile(&contract(caps, SecurityLattice::Confidential), 8, &sinks).unwrap();
+
+        let err = policy
+            .register_verified_executable(77, &"0".repeat(64))
+            .unwrap_err();
+        assert!(
+            matches!(err, CompileError::UnverifiedExecutable { .. }),
+            "{err}"
+        );
+        assert!(policy.allowed_exec_inodes.is_empty(), "nothing may be registered on refusal");
+
+        // The allowlisted digest registers, case-insensitively, and the
+        // binding recorded is the digest -- not a path, not a name.
+        policy
+            .register_verified_executable(77, &"F".repeat(64))
+            .unwrap();
+        assert_eq!(policy.allowed_exec_inodes.get(&77), Some(&"f".repeat(64)));
+    }
+
+    #[test]
+    fn one_cgroups_prefixes_never_decide_anothers_opens() {
+        // The kernel stores all cgroups' prefixes in one trie, so the C hook
+        // additionally checks the entry's owner. The simulator models the same
+        // guarantee structurally, by keeping per-cgroup PolicySets; this test
+        // pins that equivalence down.
+        let caps_a = GrantedCapabilities {
+            file_read_prefixes: vec!["/a".into()],
+            ..Default::default()
+        };
+        let caps_b = GrantedCapabilities {
+            file_read_prefixes: vec!["/b".into()],
+            ..Default::default()
+        };
+        let mut sim = KernelLsmSimulator::new();
+        sim.install(compile(&contract(caps_a.clone(), SecurityLattice::Confidential), 1, &sink_set_for(&caps_a)).unwrap());
+        sim.install(compile(&contract(caps_b.clone(), SecurityLattice::Confidential), 2, &sink_set_for(&caps_b)).unwrap());
+
+        assert_eq!(sim.file_open(1, "/a/x", false, "py").0, Verdict::Allow);
+        assert_eq!(
+            sim.file_open(1, "/b/x", false, "py").0,
+            Verdict::DenyEperm,
+            "cgroup 2's prefix must not admit an open in cgroup 1"
+        );
+        assert_eq!(sim.file_open(2, "/b/x", false, "py").0, Verdict::Allow);
     }
 }

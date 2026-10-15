@@ -1,0 +1,19 @@
+{
+  "name": "AegisCPG Approver",
+  "short_name": "Aegis",
+  "description": "FIDO2 step-up approvals for the AegisCPG control plane.",
+  "start_url": "/mobile",
+  "scope": "/mobile",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#05070c",
+  "theme_color": "#05070c",
+  "icons": [
+    {
+      "src": "/mobile/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

@@ -23,9 +23,9 @@
  *   100% and detection is 0%.
  *
  *   My first attempt hooked `syscall_trace` instead. It looked like it worked
- *   and it did not: `socket_connect`'s LSM hook runs after the handshake has
+ *   and it did not: `socket_connect`'s LSM hook runs with the handshake
  *   already been initiated, so filtering there blocked the *application* but not
- *   the *packet*. These are the real `lsm/*` sections, invoked by the security
+ *   the *packet*. These are the real lsm/... sections, invoked by the security
  *   module framework before the syscall's side effects, which is what makes
  *   "denied" mean "did not happen".
  *
@@ -34,12 +34,41 @@
  *   crates/aegis-ebpf-loader/src/policy_compiler.rs. That Rust module is the
  *   reference implementation and its unit tests assert the decision table on
  *   every host; if the two ever diverge, the kernel would be enforcing a
- *   different policy than the tests claim.
+ *   different policy than the tests claim. Divergence is impossible to see in a
+ *   diff of two languages, so the decision table is *executed* two more ways
+ *   and the verdicts are compared case by case:
+ *     * natively: compile this file with -DAEGIS_USERSPACE_SHIM and run the
+ *       real hooks as ordinary C on any host (ebpf-probes/aegis_userspace_shim.c,
+ *       driven by crates/aegis-ebpf-loader/tests/shim_equivalence.rs);
+ *     * in a VM: crates/aegis-ebpf-loader/src/bpf_vm.rs verifies and executes
+ *       RFC 9669 BPF assembly implementing the same three decisions against
+ *       the same compiled maps.
+ *   The loader refuses to install a policy if any of the three disagree.
+ *
+ *   Executable identity: the kernel cannot hash a file inside an LSM hook and
+ *   must not try -- hashing a binary in the exec path would destroy the latency
+ *   the hook exists to provide. Userspace verifies each candidate's sha256
+ *   against the TACR allowlist *before* the binary runs and registers the
+ *   verified (cgroup, inode) pair in allowed_exec_inode_map; the hook then
+ *   enforces membership. The Rust reference reaches the same verdict from the
+ *   digest side; the registration step is the bridge, and the equivalence tests
+ *   assert the verdicts agree case for case.
  *
  *   Requires Linux >= 5.7 with CONFIG_BPF_LSM=y and the kernel booted with
  *   `lsm=...,bpf`. See ebpf-probes/Dockerfile.ebpf-runner.
  */
 
+#ifdef AEGIS_USERSPACE_SHIM
+/*
+ * Native userspace execution mode. aegis_shim.h provides freestanding
+ * definitions of exactly the kernel facilities used below -- types, map
+ * declarations, helper prototypes, context structures -- so the enforcement
+ * logic in this file is compiled and executed as ordinary C on a host with no
+ * BPF and no Linux. The hooks are not re-implemented there: this same text is
+ * the code under test.
+ */
+#include "ebpf-shim/aegis_shim.h"
+#else
 #include <linux/bpf.h>
 #include <linux/audit.h>
 #include <linux/types.h>
@@ -50,6 +79,7 @@
 #include <linux/net.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
+#endif
 
 char LICENSE[] SEC("license") = "GPL";
 
@@ -129,35 +159,29 @@ struct {
     __type(value, struct path_policy);
 } allowed_path_lpm_map SEC(".maps");
 
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 256);
-    __type(key, __u64);                  /* cgroup_id */
-    __type(value, struct exec_policy);
-} allowed_exec_hash_map SEC(".maps");
-
-struct exec_policy {
-    __u32 allowed;
-    __u32 reserved[3];
-};
-
 /*
- * Executable digest allowlist, keyed by (cgroup_id, binary sha256).
- * The digest is computed by userspace and refreshed on policy update; hashing
- * inside the kernel is neither possible in the LSM hook context nor desirable,
- * because the hook must return in tens of microseconds.
+ * Trusted-executable registry: keyed by (cgroup_id, inode).
+ *
+ * The kernel cannot hash a file in the exec path, so the digest allowlist from
+ * the TACR lives in userspace: before a binary may run, the loader verifies its
+ * sha256 against allowed_exec_sha256 and registers the verified file's inode
+ * here. Registering an inode whose digest is not allowlisted is refused on the
+ * loader side, and a binary that was never verified simply has no entry -- the
+ * hook below denies it. (An inode number can be recycled after an unlink; the
+ * loader refreshes the registry on policy update, and this hook runs *before*
+ * image replacement, so the race window is a policy refresh, not an exec.)
  */
-struct exec_digest_key {
+struct exec_inode_key {
     __u64 cgroup_id;
-    __u8 digest[32];
+    __u64 inode;
 };
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 1024);
-    __type(key, struct exec_digest_key);
+    __type(key, struct exec_inode_key);
     __type(value, __u8);
-} allowed_exec_sha256_map SEC(".maps");
+} allowed_exec_inode_map SEC(".maps");
 
 /*
  * Egress allowlist, keyed by (cgroup_id, destination IPv4). Userspace inserts
@@ -211,7 +235,7 @@ static __always_inline struct path_policy *lookup_path_bytes(const char *path,
     struct {
         struct lpm_trie_key hdr;
         __u8 data[AEGIS_TARGET_LEN];
-    } key = {};
+    } key = {0};
 
     if (path_len == 0 || path_len > AEGIS_TARGET_LEN)
         return NULL;
@@ -259,26 +283,37 @@ SEC("lsm/bprm_check_security")
 int BPF_PROG(aegis_bprm_check_security, struct linux_binprm *bprm)
 {
     struct cgroup_policy *pol;
+    struct exec_inode_key key = {0};
+    __u8 *registered = NULL;
     __u64 cg = bpf_get_current_cgroup_id();
     __u64 t0, latency;
-    int deny = 1;
 
     t0 = bpf_ktime_get_ns();
     pol = lookup_policy(cg);
 
-    if (policy_active(pol) && (pol->allow_bitmask & AEGIS_CAP_EXEC_BIT) &&
-        !(pol->deny_bitmask & AEGIS_CAP_EXEC_BIT))
-        deny = 0;
-
-    if (deny) {
-        latency = bpf_ktime_get_ns() - t0;
-        emit(AEGIS_HOOK_BPRM, -EPERM, cg, "exec", latency);
-        /* Returned BEFORE the process image is replaced: not one instruction
-         * of the attacker binary has executed. */
-        return -EPERM;
+    /*
+     * Identity check first: only a binary whose digest userspace verified
+     * against the TACR allowlist has a registered inode (see the registry's
+     * comment). Everything else is denied regardless of the capability bit.
+     */
+    if (bprm->file) {
+        key.cgroup_id = cg;
+        key.inode = bprm->file->f_inode->i_ino;
+        registered = bpf_map_lookup_elem(&allowed_exec_inode_map, &key);
     }
 
-    return 0;
+    if (policy_active(pol) && (pol->allow_bitmask & AEGIS_CAP_EXEC_BIT) &&
+        !(pol->deny_bitmask & AEGIS_CAP_EXEC_BIT) && registered) {
+        latency = bpf_ktime_get_ns() - t0;
+        emit(AEGIS_HOOK_BPRM, 0, cg, "exec", latency);
+        return 0;
+    }
+
+    latency = bpf_ktime_get_ns() - t0;
+    emit(AEGIS_HOOK_BPRM, -EPERM, cg, "exec", latency);
+    /* Returned BEFORE the process image is replaced: not one instruction
+     * of the attacker binary has executed. */
+    return -EPERM;
 }
 
 /* ------------------------------------------------------------------ */
@@ -292,31 +327,50 @@ int BPF_PROG(aegis_file_open, struct file *file)
     __u64 cg = bpf_get_current_cgroup_id();
     __u64 t0, latency;
     __u32 path_len = 0;
+    __u32 wanted;
     char path[AEGIS_TARGET_LEN];
     long err;
-    int write = 0;
 
     t0 = bpf_ktime_get_ns();
     pol = lookup_policy(cg);
-    if (!policy_active(pol))
-        return 0;
+
+    /* Fail closed without an active policy: an unmanaged cgroup reads and
+     * writes nothing, exactly as it executes nothing. The Rust reference
+     * returns DenyEperm for a missing entry on every hook. */
+    if (!policy_active(pol)) {
+        emit(AEGIS_HOOK_FILE_OPEN, -EPERM, cg, "no-policy", 0);
+        return -EPERM;
+    }
 
     err = bpf_d_path(&file->f_path, path, sizeof(path));
-    if (err <= 0)
-        return 0;
-    path_len = err;
+    if (err <= 0) {
+        /* A path that cannot be resolved cannot be matched against the prefix
+         * allowlist: failure to decide is a denial, never an allow. */
+        emit(AEGIS_HOOK_FILE_OPEN, -EPERM, cg, "path-unresolved", 0);
+        return -EPERM;
+    }
+    path_len = (__u32)err;
 
-    /* Read vs write is decided by the granted bitmask, so a read-granted tool
-     * cannot write even inside an allowed prefix. */
-    if (pol->allow_bitmask & AEGIS_CAP_FILE_WRITE_BIT)
-        write = 1;
-    if (write && !(pol->allow_bitmask & AEGIS_CAP_FILE_WRITE_BIT))
-        return 0;
+    /* Read vs write comes from the open mode, so a read-granted tool cannot
+     * write even inside an allowed prefix. Deny wins over allow, matching
+     * CgroupPolicyEntry::permits in the Rust reference. */
+    if ((file->f_flags & O_WRONLY) || (file->f_flags & O_RDWR))
+        wanted = AEGIS_CAP_FILE_WRITE_BIT;
+    else
+        wanted = AEGIS_CAP_FILE_READ_BIT;
+    if ((pol->deny_bitmask & wanted) || !(pol->allow_bitmask & wanted)) {
+        emit(AEGIS_HOOK_FILE_OPEN, -EPERM, cg, path, 0);
+        return -EPERM;
+    }
 
     pp = lookup_path_bytes(path, path_len);
 
     /* Default deny. A path with no matching prefix is outside every granted
-     * directory, and allowing it would make the allowlist meaningless. */
+     * directory, and allowing it would make the allowlist meaningless. The
+     * trie returns the longest stored prefix, so a deny entry nested under an
+     * allowed directory wins; the value's cgroup_id check is what keeps one
+     * cgroup's entries from deciding another cgroup's opens, since all
+     * prefixes share one trie. */
     if (pp && pp->allow && pp->cgroup_id == cg) {
         latency = bpf_ktime_get_ns() - t0;
         emit(AEGIS_HOOK_FILE_OPEN, 0, cg, path, latency);
@@ -336,10 +390,9 @@ int BPF_PROG(aegis_socket_connect, struct socket *sock, struct sockaddr *address
              int address_len)
 {
     struct cgroup_policy *pol;
-    struct net_key key = {};
+    struct net_key key = {0};
     __u64 cg = bpf_get_current_cgroup_id();
     __u64 t0, latency;
-    char text[AEGIS_TARGET_LEN];
     __u8 *allowed;
 
     t0 = bpf_ktime_get_ns();
@@ -347,16 +400,19 @@ int BPF_PROG(aegis_socket_connect, struct socket *sock, struct sockaddr *address
 
     /* Family must be checked before casting: reading a sockaddr_in6 as a
      * sockaddr_in would produce a nonsense address and could match an allowed
-     * entry. Fail closed on any family we do not understand. */
+     * entry. Fail closed on any family we do not understand -- an address the
+     * policy cannot name is an address it does not permit, which is the same
+     * verdict the Rust reference reaches when an address literal will not
+     * parse as IPv4. */
     if (address->sa_family != 2 /* AF_INET */) {
-        if (pol && (pol->allow_bitmask & AEGIS_CAP_NET_IN_BIT))
-            return 0;
         emit(AEGIS_HOOK_SOCKET_CONNECT, -EPERM, cg, "non-ipv4", 0);
         return -EPERM;
     }
 
-    if (!policy_active(pol))
-        return 0;
+    if (!policy_active(pol)) {
+        emit(AEGIS_HOOK_SOCKET_CONNECT, -EPERM, cg, "no-policy", 0);
+        return -EPERM;
+    }
     if (!(pol->allow_bitmask & AEGIS_CAP_NET_OUT_BIT) ||
         (pol->deny_bitmask & AEGIS_CAP_NET_OUT_BIT)) {
         emit(AEGIS_HOOK_SOCKET_CONNECT, -EPERM, cg, "egress-denied", 0);
@@ -368,10 +424,8 @@ int BPF_PROG(aegis_socket_connect, struct socket *sock, struct sockaddr *address
     allowed = bpf_map_lookup_elem(&allowed_net_map, &key);
 
     if (allowed) {
-        /* Render for the audit record only; the decision is already made. */
-        text[0] = '\0';
         latency = bpf_ktime_get_ns() - t0;
-        emit(AEGIS_HOOK_SOCKET_CONNECT, 0, cg, text, latency);
+        emit(AEGIS_HOOK_SOCKET_CONNECT, 0, cg, "", latency);
         return 0;
     }
 

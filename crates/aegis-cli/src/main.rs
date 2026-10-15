@@ -4,8 +4,9 @@
 //! **Repository:** <https://github.com/PrathamKapoor>
 //!
 //! ## WHAT
-//! `aegis-cli` with four subcommands: `scan`, `verify`, `benchmark`, and
-//! `audit-and-enforce`, which runs all four stages end to end.
+//! `aegis-cli` with five subcommands: `scan`, `verify`, `check-tla`,
+//! `benchmark`, and `audit-and-enforce`, which runs all four stages end to
+//! end.
 //!
 //! ## WHY
 //! The CLI is how a security property becomes checkable by someone who did not
@@ -26,9 +27,10 @@ use aegis_common::tacr::{CompositionPolicy, GrantedCapabilities, TacrContract};
 use aegis_common::types::{CompressedDtg, SinkKind, MAX_HOP_DEPTH};
 use aegis_common::{SecurityLattice, AEGIS_PRODUCT, AEGIS_VERSION};
 use aegis_dtg_parser::{collect_source_files, extract_source, scan_repository};
-use aegis_smt_verifier::{
-    verify_and_cross_check, WorkflowGraph,
+use aegis_smt_verifier::tla_model_checker::{
+    run_model_check, GuardMode, MutationKind, SearchLimits, TlaModel,
 };
+use aegis_smt_verifier::{verify_and_cross_check, WorkflowGraph};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -39,13 +41,48 @@ pub const EXIT_VIOLATIONS: i32 = 1;
 /// Exit code: the command was used incorrectly.
 pub const EXIT_USAGE: i32 = 2;
 
+/// `check-tla --mode`: how the `GatewayEnforced` constant is interpreted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlaMode {
+    /// Force `GatewayEnforced := TRUE` (the AegisCPG reference monitor).
+    Enforced,
+    /// Use the `.cfg`'s own `GatewayEnforced` value.
+    AsConfigured,
+}
+
+/// `check-tla --expect`: the outcome the run must match for exit code `0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlaExpect {
+    /// No reachable state may violate any checked invariant.
+    Clean,
+    /// At least one reachable violation is required (mutation runs).
+    Violations,
+}
+
 /// Parsed arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// Stage 1 only: extract and compress.
-    Scan { path: PathBuf, json: bool },
+    Scan {
+        path: PathBuf,
+        json: bool,
+        /// Where to write one `<server>.dtg.json` per graph, the exact shape
+        /// the gateway's `AEGIS_GRAPHS` loader reads.
+        emit_graphs: Option<PathBuf>,
+    },
     /// Stage 3: compositional verification over a workflow graph.
     Verify { config: PathBuf, emit_smt: bool },
+    /// Stage 4: native TLA+ model checking of the MCPShield LTS.
+    CheckTla {
+        spec: PathBuf,
+        config: PathBuf,
+        mode: TlaMode,
+        mutation: Option<MutationKind>,
+        expect: TlaExpect,
+        min_states: Option<usize>,
+        max_states: Option<usize>,
+        json: bool,
+    },
     /// The benchmark harness.
     Benchmark { suite: String },
     /// All four stages.
@@ -64,14 +101,70 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
     };
     match sub.as_str() {
         "scan" => {
-            let path = flag_value(&mut iter, "--path")?;
-            let json = iter.any(|a| a == "--json");
-            Ok(Command::Scan { path, json })
+            let rest: Vec<String> = iter.cloned().collect();
+            let path = PathBuf::from(require_flag(&rest, "--path")?);
+            let json = rest.iter().any(|a| a == "--json");
+            let emit_graphs = value_of(&rest, "--emit-graphs").map(PathBuf::from);
+            Ok(Command::Scan {
+                path,
+                json,
+                emit_graphs,
+            })
         }
         "verify" => {
             let config = flag_value(&mut iter, "--config")?;
             let emit_smt = iter.any(|a| a == "--smt");
             Ok(Command::Verify { config, emit_smt })
+        }
+        "check-tla" => {
+            let rest: Vec<String> = iter.cloned().collect();
+            let spec = require_flag(&rest, "--spec")?;
+            let config = require_flag(&rest, "--config")?;
+            let mode = match value_of(&rest, "--mode").as_deref() {
+                None | Some("enforced") => TlaMode::Enforced,
+                Some("as-configured") => TlaMode::AsConfigured,
+                Some(other) => {
+                    return Err(format!(
+                        "unknown --mode '{other}' (expected enforced|as-configured)"
+                    ));
+                }
+            };
+            let mutation = match value_of(&rest, "--mutation") {
+                None => None,
+                Some(id) => Some(MutationKind::parse(&id).ok_or_else(|| {
+                    format!(
+                        "unknown --mutation '{id}' (one of: allow-mutated-hash-execution, \
+                         allow-unapproved-cross-domain-write, allow-unbounded-capability-call, \
+                         allow-unbridged-context-bleed)"
+                    )
+                })?),
+            };
+            let expect = match value_of(&rest, "--expect").as_deref() {
+                Some("clean") => TlaExpect::Clean,
+                Some("violations") => TlaExpect::Violations,
+                Some(other) => {
+                    return Err(format!(
+                        "unknown --expect '{other}' (expected clean|violations)"
+                    ));
+                }
+                // A mutation run is a negative test: violations are the
+                // expected outcome unless said otherwise.
+                None if mutation.is_some() => TlaExpect::Violations,
+                None => TlaExpect::Clean,
+            };
+            let min_states = parse_count(&rest, "--min-states")?;
+            let max_states = parse_count(&rest, "--max-states")?;
+            let json = rest.iter().any(|a| a == "--json");
+            Ok(Command::CheckTla {
+                spec: PathBuf::from(spec),
+                config: PathBuf::from(config),
+                mode,
+                mutation,
+                expect,
+                min_states,
+                max_states,
+                json,
+            })
         }
         "benchmark" => {
             let suite = iter
@@ -107,6 +200,32 @@ where
     Err(format!("missing required flag {flag}"))
 }
 
+/// The value following `flag`, or `None` when the flag is absent or dangles
+/// into the next flag (fail closed rather than consuming `--json` as a path).
+fn value_of(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .filter(|v| !v.starts_with("--"))
+        .cloned()
+}
+
+/// The value following a required flag; a usage error when absent.
+fn require_flag(args: &[String], flag: &str) -> Result<String, String> {
+    value_of(args, flag).ok_or_else(|| format!("missing required flag {flag}"))
+}
+
+/// Parses `--flag N` as a non-negative count.
+fn parse_count(args: &[String], flag: &str) -> Result<Option<usize>, String> {
+    match value_of(args, flag) {
+        None => Ok(None),
+        Some(v) => v
+            .parse::<usize>()
+            .map(Some)
+            .map_err(|_| format!("{flag} expects a non-negative integer, got '{v}'")),
+    }
+}
+
 /// The usage text.
 pub fn usage() -> String {
     format!(
@@ -116,8 +235,11 @@ pub fn usage() -> String {
              aegis-cli <SUBCOMMAND> [OPTIONS]\n\
          \n\
          SUBCOMMANDS:\n    \
-             scan --path <DIR|FILE> [--json] Stage 1: extract and compress the DTG\n    \
+             scan --path <DIR|FILE> [--json] [--emit-graphs <DIR>]\n    \
+                                             Stage 1: extract and compress the DTG\n    \
              verify --config <FILE> [--smt]  Stage 3: compositional verification\n    \
+             check-tla --spec <F> --config <F> [--mode <M>] [--mutation <ID>]\n    \
+                                              Stage 4: native TLA+ model check\n    \
              benchmark [all]                 Run the benchmark harness\n    \
              audit-and-enforce --repo <DIR>  All four stages, end to end\n    \
              version | help\n\
@@ -129,7 +251,14 @@ pub fn usage() -> String {
              Every number printed is measured in this run, not stored.\n    \
              `scan --json` emits the full CompressedDtg per server so that\n    \
              benchmarks/run_all_benchmarks.py measures this binary rather than\n    \
-             a transcription of it.\n"
+             a transcription of it.\n    \
+             `scan --emit-graphs <DIR>` writes one `<server>.dtg.json` per\n    \
+             server: exactly the serde_json form the gateway reloads from\n    \
+             AEGIS_GRAPHS, so the portal and the Cypher endpoint can only\n    \
+             serve graphs Stage 1 derived.\n    \
+             `check-tla` exits 0 only when the run matches --expect (clean by\n    \
+             default; --mutation implies violations, which is its negative\n    \
+             test). --min-states guards a non-trivial state space.\n"
     )
 }
 
@@ -144,24 +273,39 @@ pub fn run(command: Command) -> i32 {
             println!("{AEGIS_PRODUCT} {AEGIS_VERSION}");
             EXIT_OK
         }
-        Command::Scan { path, json } => {
-            let outcome = if json {
-                cmd_scan_json(&path)
-            } else {
-                cmd_scan(&path)
-            };
-            match outcome {
-                Ok(code) => code,
-                Err(e) => {
-                    eprintln!("scan failed: {e}");
-                    EXIT_VIOLATIONS
-                }
+        Command::Scan {
+            path,
+            json,
+            emit_graphs,
+        } => match run_scan(&path, json, emit_graphs.as_deref()) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("scan failed: {e}");
+                EXIT_VIOLATIONS
             }
-        }
+        },
         Command::Verify { config, emit_smt } => match cmd_verify(&config, emit_smt) {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("verify failed: {e}");
+                EXIT_VIOLATIONS
+            }
+        },
+        Command::CheckTla {
+            spec,
+            config,
+            mode,
+            mutation,
+            expect,
+            min_states,
+            max_states,
+            json,
+        } => match cmd_check_tla(
+            &spec, &config, mode, mutation, expect, min_states, max_states, json,
+        ) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("check-tla failed: {e}");
                 EXIT_VIOLATIONS
             }
         },
@@ -208,8 +352,12 @@ impl ScanRow {
     }
 }
 
-/// Runs Stage 1 over a file or a directory.
-pub fn scan(path: &Path) -> Result<Vec<ScanRow>, String> {
+/// Runs Stage 1 over a file or a directory, returning the graphs themselves.
+///
+/// One extraction pass feeds the three outputs (`scan`'s table, `scan --json`,
+/// and `scan --emit-graphs`), so a report can never describe a different run
+/// than the files written beside it.
+pub fn scan_graphs(path: &Path) -> Result<Vec<CompressedDtg>, String> {
     let dtgs = if path.is_file() {
         let ext = path
             .extension()
@@ -237,7 +385,72 @@ pub fn scan(path: &Path) -> Result<Vec<ScanRow>, String> {
     } else {
         scan_repository(path).map_err(|e| e.to_string())?
     };
-    Ok(dtgs.iter().map(row_for).collect())
+    Ok(dtgs)
+}
+
+/// Runs Stage 1 over a file or a directory.
+pub fn scan(path: &Path) -> Result<Vec<ScanRow>, String> {
+    Ok(scan_graphs(path)?.iter().map(row_for).collect())
+}
+
+/// Writes one `<server>.dtg.json` per graph into `dir`.
+///
+/// This is the producer side of the gateway's `AEGIS_GRAPHS` variable: the
+/// files are exactly the pretty-printed `CompressedDtg` JSON that
+/// `serde_json::from_str::<CompressedDtg>` reloads, so the portal and the
+/// Cypher endpoint can only ever serve graphs that Stage 1 actually derived.
+///
+/// A server id is often a filesystem path, so the file name is sanitised to
+/// `[A-Za-z0-9._-]`; collisions after sanitising get a numeric suffix rather
+/// than overwriting a graph the run just wrote.
+fn emit_graph_files(dtgs: &[CompressedDtg], dir: &Path) -> Result<usize, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let mut used: BTreeSet<String> = BTreeSet::new();
+    for dtg in dtgs {
+        let stem: String = dtg
+            .server_id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let mut name = stem.clone();
+        let mut counter = 1u32;
+        while !used.insert(name.clone()) {
+            name = format!("{stem}-{counter}");
+            counter += 1;
+        }
+        let path = dir.join(format!("{name}.dtg.json"));
+        let text = serde_json::to_string_pretty(dtg)
+            .map_err(|e| format!("cannot serialise {}: {e}", dtg.server_id))?;
+        std::fs::write(&path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    }
+    Ok(dtgs.len())
+}
+
+/// Runs the whole `scan` subcommand: one extraction, then the requested
+/// outputs in a fixed order (graph files, then the report on stdout).
+fn run_scan(path: &Path, json: bool, emit_graphs: Option<&Path>) -> Result<i32, String> {
+    let dtgs = scan_graphs(path)?;
+    if let Some(dir) = emit_graphs {
+        let written = emit_graph_files(&dtgs, dir)?;
+        println!(
+            "wrote {written} Data Transformation Graph(s) to {}",
+            dir.display()
+        );
+    }
+    if json {
+        let document = scan_json_document(path, &dtgs);
+        let text = serde_json::to_string_pretty(&document).map_err(|e| e.to_string())?;
+        println!("{text}");
+        return Ok(EXIT_OK);
+    }
+    let rows: Vec<ScanRow> = dtgs.iter().map(row_for).collect();
+    Ok(print_scan_table(path, &rows))
 }
 
 fn row_for(dtg: &CompressedDtg) -> ScanRow {
@@ -257,11 +470,10 @@ fn row_for(dtg: &CompressedDtg) -> ScanRow {
     }
 }
 
-fn cmd_scan(path: &Path) -> Result<i32, String> {
-    let rows = scan(path)?;
+fn print_scan_table(path: &Path, rows: &[ScanRow]) -> i32 {
     if rows.is_empty() {
         println!("no MCP servers detected under {}", path.display());
-        return Ok(EXIT_OK);
+        return EXIT_OK;
     }
 
     println!(
@@ -270,7 +482,7 @@ fn cmd_scan(path: &Path) -> Result<i32, String> {
     );
     println!("{}", "-".repeat(140));
     let mut dynamic_seen = false;
-    for r in &rows {
+    for r in rows {
         let sinks: Vec<&str> = r.detected_sinks.iter().map(|s| s.as_str()).collect();
         println!(
             "{:<34} {:<11} {:>5} {:>9} {:>9} {:>8.1}%  {:<7} {}",
@@ -297,7 +509,7 @@ fn cmd_scan(path: &Path) -> Result<i32, String> {
             "no dynamic dispatch observed"
         }
     );
-    Ok(EXIT_OK)
+    EXIT_OK
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -404,34 +616,13 @@ pub struct ScanJson {
 
 /// Runs Stage 1 and emits the result as JSON on stdout.
 pub fn scan_json(path: &Path) -> Result<ScanJson, String> {
-    let dtgs = if path.is_file() {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .ok_or_else(|| format!("{} has no extension, so its language is unknown", path.display()))?;
-        let language = aegis_dtg_parser::Language::from_extension(ext).ok_or_else(|| {
-            format!("unsupported source extension '.{ext}' for {}", path.display())
-        })?;
-        let source = std::fs::read_to_string(path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let unit = extract_source(
-            &path.display().to_string(),
-            &path.display().to_string(),
-            language,
-            &source,
-        )
-        .map_err(|e| e.to_string())?;
-        let (dtg, _) = aegis_dtg_parser::build_server_dtg(
-            &path.display().to_string(),
-            std::slice::from_ref(&unit),
-        )
-        .map_err(|e| e.to_string())?;
-        vec![dtg]
-    } else {
-        scan_repository(path).map_err(|e| e.to_string())?
-    };
+    let dtgs = scan_graphs(path)?;
+    Ok(scan_json_document(path, &dtgs))
+}
 
-    Ok(ScanJson {
+/// Builds the `scan --json` document from graphs that were already extracted.
+fn scan_json_document(path: &Path, dtgs: &[CompressedDtg]) -> ScanJson {
+    ScanJson {
         schema: "aegis.scan.v1".to_string(),
         product: AEGIS_PRODUCT.to_string(),
         version: AEGIS_VERSION.to_string(),
@@ -439,14 +630,7 @@ pub fn scan_json(path: &Path) -> Result<ScanJson, String> {
         hop_bound: MAX_HOP_DEPTH,
         server_count: dtgs.len(),
         servers: dtgs.iter().map(ScanJsonRow::from_dtg).collect(),
-    })
-}
-
-fn cmd_scan_json(path: &Path) -> Result<i32, String> {
-    let document = scan_json(path)?;
-    let text = serde_json::to_string_pretty(&document).map_err(|e| e.to_string())?;
-    println!("{text}");
-    Ok(EXIT_OK)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -790,6 +974,133 @@ fn cmd_audit_and_enforce(repo: &Path) -> Result<i32, String> {
 }
 
 // ---------------------------------------------------------------------------
+// check-tla
+// ---------------------------------------------------------------------------
+
+/// Runs the native TLA+ model checker over `spec` + `config`.
+///
+/// Exit `0` iff the run matches `expect` and satisfies `--min-states`; every
+/// mismatch (and every load error) fails closed with `1`. `--max-states`
+/// bounds the search for smoke runs: a clean verdict from a bounded search is
+/// reported as partial, which is why the full gates read the whole space.
+#[allow(clippy::too_many_arguments)]
+fn cmd_check_tla(
+    spec: &Path,
+    config: &Path,
+    mode: TlaMode,
+    mutation: Option<MutationKind>,
+    expect: TlaExpect,
+    min_states: Option<usize>,
+    max_states: Option<usize>,
+    json: bool,
+) -> Result<i32, String> {
+    let model = TlaModel::from_paths(spec, config).map_err(|e| {
+        format!(
+            "could not load {} + {}: {e}",
+            spec.display(),
+            config.display()
+        )
+    })?;
+
+    let guard = match mutation {
+        Some(kind) => GuardMode::Mutated(kind),
+        None => match mode {
+            TlaMode::Enforced => GuardMode::Enforced,
+            TlaMode::AsConfigured => GuardMode::AsConfigured,
+        },
+    };
+    let mut limits = SearchLimits {
+        // A negative test wants the shortest witness; a positive gate wants
+        // the whole reachable space.
+        stop_at_first_violation: expect == TlaExpect::Violations,
+        ..SearchLimits::default()
+    };
+    if let Some(kind) = mutation {
+        limits.only_invariants = Some(vec![kind.target_invariant().to_string()]);
+    }
+    if let Some(n) = max_states {
+        limits.max_states = n;
+    }
+
+    let report =
+        run_model_check(&model, guard, &limits).map_err(|e| format!("model check failed: {e}"))?;
+
+    let mut failures: Vec<String> = Vec::new();
+    if let Some(min) = min_states {
+        if report.distinct_states < min {
+            failures.push(format!(
+                "only {} distinct states were explored, --min-states {min}",
+                report.distinct_states
+            ));
+        }
+    }
+    let observed = if report.is_clean() {
+        TlaExpect::Clean
+    } else {
+        TlaExpect::Violations
+    };
+    if observed != expect {
+        failures.push(match expect {
+            TlaExpect::Clean => format!(
+                "expected a clean run but found {} violation(s)",
+                report.violations.len()
+            ),
+            TlaExpect::Violations => "expected a violation but the model is clean".to_string(),
+        });
+    }
+
+    if json {
+        let value = report.to_json();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
+        );
+    } else {
+        let mode_text = match mutation {
+            Some(kind) => format!("mutation {} (target {})", kind.id(), kind.target_invariant()),
+            None => match mode {
+                TlaMode::Enforced => "reference monitor (GatewayEnforced := TRUE)".to_string(),
+                TlaMode::AsConfigured => "as configured".to_string(),
+            },
+        };
+        println!("check-tla: {}", mode_text);
+        println!("  spec       : {}", spec.display());
+        println!("  config     : {}", config.display());
+        println!("  invariants : {}", report.invariants_checked.join(", "));
+        println!(
+            "  states     : {} ({} taken, {} evaluated)",
+            report.distinct_states, report.transitions_taken, report.transitions_evaluated
+        );
+        println!("  duration   : {:.1} ms", report.duration_ms);
+        if report.limits_hit {
+            println!("  PARTIAL    : the search bound was reached before exhaustion");
+        }
+        for v in &report.violations {
+            println!("  VIOLATION  {} at depth {}", v.invariant, v.depth);
+            for step in &v.trace {
+                println!("    {step}");
+            }
+        }
+        println!(
+            "  RESULT     : {}",
+            if report.is_clean() {
+                "no reachable violation of any checked invariant"
+            } else {
+                "reachable violations observed (see above)"
+            }
+        );
+    }
+
+    if failures.is_empty() {
+        return Ok(EXIT_OK);
+    }
+    for f in &failures {
+        eprintln!("check-tla: {f}");
+    }
+    Ok(EXIT_VIOLATIONS)
+}
+
+// ---------------------------------------------------------------------------
 // benchmark
 // ---------------------------------------------------------------------------
 
@@ -848,14 +1159,31 @@ mod tests {
             parse_args(&args(&["scan", "--path", "C:/repo"])).unwrap(),
             Command::Scan {
                 path: PathBuf::from("C:/repo"),
-                json: false
+                json: false,
+                emit_graphs: None,
             }
         );
         assert_eq!(
             parse_args(&args(&["scan", "--path", "C:/repo", "--json"])).unwrap(),
             Command::Scan {
                 path: PathBuf::from("C:/repo"),
-                json: true
+                json: true,
+                emit_graphs: None,
+            }
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "scan",
+                "--path",
+                "C:/repo",
+                "--emit-graphs",
+                "C:/graphs"
+            ]))
+            .unwrap(),
+            Command::Scan {
+                path: PathBuf::from("C:/repo"),
+                json: false,
+                emit_graphs: Some(PathBuf::from("C:/graphs")),
             }
         );
         assert_eq!(
@@ -903,6 +1231,120 @@ mod tests {
     fn unknown_subcommands_are_rejected() {
         let err = parse_args(&args(&["rm", "-rf"])).unwrap_err();
         assert!(err.contains("unknown subcommand"));
+    }
+
+    #[test]
+    fn check_tla_parses_its_flags() {
+        assert_eq!(
+            parse_args(&args(&["check-tla", "--spec", "s.tla", "--config", "c.cfg"])).unwrap(),
+            Command::CheckTla {
+                spec: PathBuf::from("s.tla"),
+                config: PathBuf::from("c.cfg"),
+                mode: TlaMode::Enforced,
+                mutation: None,
+                expect: TlaExpect::Clean,
+                min_states: None,
+                max_states: None,
+                json: false,
+            }
+        );
+        // A mutation run is a negative test: violations are expected unless
+        // stated otherwise, and only the target invariant is checked.
+        let parsed = parse_args(&args(&[
+            "check-tla",
+            "--spec",
+            "s.tla",
+            "--config",
+            "c.cfg",
+            "--mutation",
+            "allow-unbridged-context-bleed",
+            "--min-states",
+            "200",
+            "--json",
+        ]))
+        .unwrap();
+        match parsed {
+            Command::CheckTla {
+                mutation: Some(m),
+                expect: TlaExpect::Violations,
+                min_states: Some(200),
+                json: true,
+                ..
+            } => assert_eq!(m.target_invariant(), "ContextIsolationInvariant"),
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        // Fail-closed surface: missing flags, unknown values, bad counts.
+        assert!(parse_args(&args(&["check-tla", "--spec", "s.tla"])).is_err());
+        assert!(parse_args(&args(&["check-tla", "--spec", "s.tla", "--config"])).is_err());
+        assert!(parse_args(&args(&[
+            "check-tla",
+            "--spec",
+            "s.tla",
+            "--config",
+            "c.cfg",
+            "--mutation",
+            "nope"
+        ]))
+        .is_err());
+        assert!(parse_args(&args(&[
+            "check-tla",
+            "--spec",
+            "s.tla",
+            "--config",
+            "c.cfg",
+            "--mode",
+            "nope"
+        ]))
+        .is_err());
+        assert!(parse_args(&args(&[
+            "check-tla",
+            "--spec",
+            "s.tla",
+            "--config",
+            "c.cfg",
+            "--min-states",
+            "many"
+        ]))
+        .is_err());
+    }
+
+    /// End to end against the real `specs/` files, exactly as the documented
+    /// CLI invocation does: a mutation must be observed being caught, and the
+    /// reference-monitor run must stay clean over a bounded search.
+    #[test]
+    fn check_tla_runs_the_real_spec() {
+        let specs = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("specs");
+        let spec = specs.join("MCPShieldLTS.tla");
+        let safe = specs.join("MCPShieldLTS.safe.cfg");
+
+        let code = cmd_check_tla(
+            &spec,
+            &safe,
+            TlaMode::Enforced,
+            Some(MutationKind::AllowUnbridgedContextBleed),
+            TlaExpect::Violations,
+            None,
+            None,
+            true,
+        )
+        .expect("mutation run must execute");
+        assert_eq!(code, EXIT_OK, "the mutation must be caught");
+
+        let code = cmd_check_tla(
+            &spec,
+            &safe,
+            TlaMode::Enforced,
+            None,
+            TlaExpect::Clean,
+            Some(50),
+            Some(400),
+            true,
+        )
+        .expect("clean run must execute");
+        assert_eq!(code, EXIT_OK, "the reference-monitor model stays clean");
     }
 
     #[test]
@@ -999,6 +1441,73 @@ mod tests {
         let back: ScanJson = serde_json::from_str(&text).expect("the emitted JSON must round-trip");
         assert_eq!(back.servers[0].dtg.dtg_sha256, document.servers[0].dtg_sha256);
         assert!(back.servers[0].sink_kinds.contains(&"CommandExec".to_string()));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn emit_graphs_writes_reloadable_compressed_dtgs() {
+        // The gateway reloads these files with
+        // `serde_json::from_str::<CompressedDtg>`; this test is that exact
+        // round trip, one file per server, and requires the reloaded graph to
+        // equal the extracted one -- not merely to have the same hash.
+        let tmp = std::env::temp_dir().join(format!("aegis-emit-{}", std::process::id()));
+        let out = std::env::temp_dir().join(format!("aegis-emit-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("server.py"),
+            "@mcp.tool()\ndef run(p):\n    import base64, subprocess\n    \
+             return subprocess.run(base64.b64decode(p), capture_output=True)\n",
+        )
+        .unwrap();
+
+        let dtgs = scan_graphs(&tmp).expect("the fixture scans");
+        let written = emit_graph_files(&dtgs, &out).expect("graphs are written");
+        assert_eq!(written, dtgs.len());
+
+        let mut reloaded = 0;
+        for entry in std::fs::read_dir(&out).unwrap().flatten() {
+            assert!(entry
+                .path()
+                .to_string_lossy()
+                .ends_with(".dtg.json"));
+            let text = std::fs::read_to_string(entry.path()).unwrap();
+            let dtg: CompressedDtg =
+                serde_json::from_str(&text).expect("a reloadable CompressedDtg");
+            let original = dtgs
+                .iter()
+                .find(|d| d.dtg_sha256 == dtg.dtg_sha256)
+                .expect("the reloaded graph is one that was written");
+            assert_eq!(&dtg, original, "serde round trip must be lossless");
+            reloaded += 1;
+        }
+        assert_eq!(reloaded, dtgs.len());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn the_scan_table_rows_come_from_the_extracted_graph() {
+        let tmp = std::env::temp_dir().join(format!("aegis-rows-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("server.py"),
+            "@mcp.tool()\ndef read(p):\n    import subprocess\n    \
+             return subprocess.run(p, capture_output=True)\n",
+        )
+        .unwrap();
+
+        let rows = scan(&tmp).expect("the fixture scans");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tools, 1);
+        assert_eq!(rows[0].language, "python");
+        assert!(rows[0].raw_cpg_node_count >= rows[0].compressed_node_count);
+        assert!(rows[0].compression_ratio > 0.0 && rows[0].compression_ratio <= 1.0);
+        assert_eq!(rows[0].dtg_sha256.len(), 64);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

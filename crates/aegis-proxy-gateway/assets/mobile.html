@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<!--
+  AegisCPG mobile approver -- the FIDO2 PWA half of TV13's answer.
+
+  Author: Pratham Kapoor <prathamkapoor027@gmail.com>
+  Repository: github.com/PrathamKapoor (scheme omitted deliberately: this page
+  may reference no external origin, and the test suite enforces it)
+
+  WHAT: Requests a step-up challenge from the gateway, runs a WebAuthn
+        navigator.credentials.get ceremony on the phone's platform
+        authenticator, converts the DER signature browsers produce into the
+        64-byte r||s form the verifier expects, and hands the assertion to
+        POST /fido2/verify, where the server -- not this page -- records the
+        declassification.
+
+  WHY: The assertion must never be redeemable by the page itself. A malicious
+        server (TV13) would otherwise forge an "assertion_verified: true" claim
+        to release data; here the page can only *present* a signature, and the
+        gateway decides. The DER-to-raw conversion is not cosmetic: WebAuthn
+        returns ASN.1 DER for ES256, and the verifier requires the raw 64-byte
+        form, so a naive page would fail every honest approval.
+
+  HOW: Challenge -> credentials.get -> POST verify. No framework, no external
+        assets; works offline once installed (see sw.js).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#05070c">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<link rel="manifest" href="/mobile/manifest.webmanifest">
+<link rel="icon" href="/mobile/icon.svg" type="image/svg+xml">
+<title>AegisCPG approver</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0 auto; max-width: 560px; padding: 18px 16px 60px;
+         font: 15px/1.5 ui-rounded, system-ui, -apple-system, sans-serif;
+         background: #05070c; color: #d7dee9; }
+  h1 { font-size: 19px; margin: 0 0 4px; }
+  h2 { font-size: 13px; color: #64748b; text-transform: uppercase; letter-spacing: .1em;
+       margin: 22px 0 8px; }
+  label { display: block; font-size: 12px; color: #94a3b8; margin: 10px 0 3px; }
+  input, button { width: 100%; box-sizing: border-box; font: inherit; padding: 11px 12px;
+       border-radius: 10px; border: 1px solid #233247; background: #0b1220; color: #e6edf6; }
+  button { cursor: pointer; background: #122036; border-color: #2c4a63; }
+  button.primary { background: #0e7490; border-color: #0e7490; color: #f0fdff; font-weight: 600; }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { margin-top: 14px; padding: 12px; border-radius: 10px; background: #0b1220;
+            border: 1px solid #233247; white-space: pre-wrap; word-break: break-word; }
+  .ok { border-color: #15803d !important; } .bad { border-color: #b91c1c !important; }
+  .muted { color: #64748b; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>AEGIS&middot;CPG approver</h1>
+<div class="muted">Approve a cross-domain release with this device's authenticator.</div>
+
+<h2>1 &middot; Release request</h2>
+<label for="session">Session</label>
+<input id="session" value="agent-01" autocomplete="off">
+<label for="datum">Datum hash (what is being released)</label>
+<input id="datum" value="read_env" autocomplete="off">
+<label for="target">Target capability</label>
+<input id="target" value="s_slack" autocomplete="off">
+<label for="diff">Lattice transition</label>
+<input id="diff" value="SECRET -> PUBLIC" autocomplete="off">
+<button id="challenge">Request challenge</button>
+
+<h2>2 &middot; Approve</h2>
+<button id="approve" class="primary" disabled>Approve with device</button>
+
+<div id="status" aria-live="polite">Idle. The challenge will appear here.</div>
+
+<script>
+"use strict";
+let challenge = null;
+
+const statusBox = document.getElementById("status");
+function say(text, css) { statusBox.textContent = text; statusBox.className = css || ""; }
+
+// base64url <-> ArrayBuffer, unpadded, as the gateway's JSON uses.
+function b64ToBuffer(value) {
+  const padded = value.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
+  const raw = atob(padded);
+  const bytes = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+  return bytes.buffer;
+}
+function bufferToB64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let raw = "";
+  for (let i = 0; i < bytes.length; i++) raw += String.fromCharCode(bytes[i]);
+  return btoa(raw).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+// WebAuthn returns an ASN.1 DER ECDSA signature; the verifier requires raw
+// r||s with each integer left-padded to 32 bytes. Rejecting anything else
+// keeps a malformed signature a clear client-side error instead of a confusing
+// server-side "signature did not verify".
+function derToRaw(der) {
+  const bytes = new Uint8Array(der);
+  if (bytes[0] !== 0x30) throw new Error("DER: expected SEQUENCE");
+  let i = 2;
+  if (bytes[1] & 0x80) i = 2 + (bytes[1] & 0x7f); // long-form length
+  function integer() {
+    if (bytes[i] !== 0x02) throw new Error("DER: expected INTEGER");
+    const length = bytes[i + 1];
+    const start = i + 2, end = start + length;
+    let value = bytes.slice(start, end);
+    while (value.length > 32 && value[0] === 0) value = value.slice(1);
+    if (value.length > 32) throw new Error("DER: INTEGER wider than 32 bytes");
+    const out = new Uint8Array(32);
+    out.set(value, 32 - value.length);
+    i = end;
+    return out;
+  }
+  const r = integer(), s = integer();
+  const raw = new Uint8Array(64);
+  raw.set(r, 0); raw.set(s, 32);
+  return raw.buffer;
+}
+
+document.getElementById("challenge").addEventListener("click", async () => {
+  const params = new URLSearchParams({
+    session_id: document.getElementById("session").value,
+    datum_hash: document.getElementById("datum").value,
+    target: document.getElementById("target").value,
+    lattice_diff: document.getElementById("diff").value,
+  });
+  try {
+    const response = await fetch(`/fido2/challenge?${params}`);
+    const payload = await response.json();
+    if (!response.ok) { say(`Challenge refused: ${payload.error || response.status}`, "bad"); return; }
+    challenge = payload;
+    document.getElementById("approve").disabled = false;
+    say(`Challenge ${payload.challenge_id}\n` +
+        `rp_id=${payload.rp_id}  expires in ${payload.expires_in_secs}s\n` +
+        `Signed input: ${payload.lattice_diff}`, "ok");
+  } catch (error) {
+    say(`Gateway unreachable: ${error}`, "bad");
+  }
+});
+
+document.getElementById("approve").addEventListener("click", async () => {
+  if (!challenge) return;
+  try {
+    const allow = (challenge.allow_credentials || []).map(id => ({ type: "public-key", id: b64ToBuffer(id) }));
+    const credential = await navigator.credentials.get({
+      publicKey: {
+        challenge: b64ToBuffer(challenge.challenge_b64),
+        rpId: challenge.rp_id,
+        timeout: challenge.expires_in_secs * 1000,
+        userVerification: "required",
+        allowCredentials: allow,
+      },
+    });
+    const response = credential.response;
+    const body = {
+      challenge_id: challenge.challenge_id,
+      credential_id: bufferToB64(credential.rawId),
+      client_data_json: new TextDecoder().decode(response.clientDataJSON),
+      authenticator_data: bufferToB64(response.authenticatorData),
+      signature: bufferToB64(derToRaw(response.signature)),
+    };
+    const verdict = await (await fetch("/fido2/verify", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    })).json();
+    if (verdict.verified && verdict.approved) {
+      say(`APPROVED\ncredential ${verdict.credential_id} counter ${verdict.counter}\n` +
+          `release ${challenge.datum_hash} -> ${challenge.target} recorded`, "ok");
+      document.getElementById("approve").disabled = true;
+      challenge = null;
+    } else {
+      say(`REFUSED: ${verdict.reason}`, "bad");
+    }
+  } catch (error) {
+    say(`Ceremony failed: ${error.message || error}`, "bad");
+  }
+});
+
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/mobile/sw.js").catch(() => { /* offline shell is optional */ });
+}
+</script>
+</body>
+</html>

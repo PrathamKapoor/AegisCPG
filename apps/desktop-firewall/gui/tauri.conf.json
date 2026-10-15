@@ -8,9 +8,9 @@
   "repository": "https://github.com/PrathamKapoor/AegisCPG",
   "identifier": "dev.pratham.aegis.desktop-firewall",
   "build": {
-    "beforeDevCommand": "npm --prefix ../web-portal run dev",
-    "beforeBuildCommand": "npm --prefix ../web-portal run build",
-    "frontendDist": "../../web-portal/out",
+    "beforeDevCommand": "npm --prefix ../../web-portal run dev",
+    "beforeBuildCommand": "npm --prefix ../../web-portal run build",
+    "frontendDist": "../../../web-portal/out",
     "devUrl": "http://localhost:3000"
   },
   "app": {

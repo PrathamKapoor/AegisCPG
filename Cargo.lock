@@ -34,7 +34,16 @@ dependencies = [
 name = "aegis-desktop-core"
 version = "1.0.0"
 dependencies = [
+ "aegis-common",
  "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "aegis-desktop-firewall"
+version = "1.0.0"
+dependencies = [
+ "aegis-desktop-core",
  "serde_json",
 ]
 
@@ -62,9 +71,12 @@ name = "aegis-proxy-gateway"
 version = "1.0.0"
 dependencies = [
  "aegis-common",
+ "aegis-dtg-parser",
  "axum",
  "base64",
+ "futures-core",
  "hex",
+ "rand_core",
  "serde",
  "serde_json",
  "sha2",
@@ -913,6 +925,7 @@ version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
+ "bytes",
  "libc",
  "mio",
  "pin-project-lite",

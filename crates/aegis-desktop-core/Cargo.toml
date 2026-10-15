@@ -15,11 +15,12 @@ name = "aegis_desktop_core"
 path = "src/lib.rs"
 
 [dependencies]
-# Only the two crates the workspace already vendors. The Tauri runtime lives in
-# the sibling `apps/desktop-firewall` shell, which is excluded from the
+# Only crates the workspace already vendors. The Tauri runtime lives in the
+# sibling `apps/desktop-firewall/gui` shell, which is excluded from the
 # workspace because it cannot be fetched on this air-gapped host. Keeping the
-# logic here means it compiles and is tested; keeping it in the shell would mean
-# neither.
+# logic here means it compiles and is tested; keeping it in the shell would
+# mean neither.
+aegis-common = { path = "../aegis-common", version = "1.0.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 

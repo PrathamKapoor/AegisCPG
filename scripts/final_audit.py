@@ -366,7 +366,7 @@ def gate_rust_tests() -> Gate:
     passed = sum(int(m) for m in re.findall(r"test result: ok\. (\d+) passed", output))
     failed = sum(int(m) for m in re.findall(r"(\d+) failed", output))
     gate.require(completed.returncode == 0, f"cargo test exited {completed.returncode}")
-    gate.require(passed >= 230, f"only {passed} Rust tests ran; expected at least 230")
+    gate.require(passed >= 400, f"only {passed} Rust tests ran; expected at least 400")
     gate.require(failed == 0, f"{failed} Rust tests failed")
     gate.require(
         "warning:" not in output,
@@ -412,6 +412,61 @@ def gate_portal_tests() -> Gate:
     return gate
 
 
+def gate_service_binaries() -> Gate:
+    """The gateway and the desktop firewall link as real executables.
+
+    `cargo test --workspace` compiles these targets under the test harness; this
+    gate asks the stronger question -- that the shipped binaries link and start
+    -- because "it compiles as a test binary" and "it runs as a program" are
+    different claims. The gateway's live behaviour over TCP is covered by its
+    own integration suite; here it has to exist, be implausibly-small-proof, and
+    the firewall has to print its usage surface cleanly.
+    """
+    gate = Gate("Phase 8 service binaries")
+    completed = run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(CARGO_WRAPPER),
+            "build",
+            "--package",
+            "aegis-proxy-gateway",
+            "--package",
+            "aegis-desktop-firewall",
+        ],
+        timeout=3600,
+    )
+    gate.require(completed.returncode == 0, f"cargo build exited {completed.returncode}")
+    binaries = {
+        "aegis-proxy-gateway": REPO_ROOT / "target" / "debug" / "aegis-proxy-gateway.exe",
+        "aegis-desktop-firewall": REPO_ROOT
+        / "target"
+        / "debug"
+        / "aegis-desktop-firewall.exe",
+    }
+    for name, binary in binaries.items():
+        gate.require(
+            binary.exists() and binary.stat().st_size >= 100_000,
+            f"{name}.exe is missing or implausibly small",
+        )
+    firewall = binaries["aegis-desktop-firewall"]
+    if firewall.exists():
+        usage = run([str(firewall)], timeout=120)
+        gate.require(
+            usage.returncode == 0,
+            f"aegis-desktop-firewall exited {usage.returncode} with no arguments",
+        )
+        gate.require(
+            "verify-config" in usage.stdout,
+            "the firewall usage does not list verify-config",
+        )
+    print("        gateway and desktop-firewall binaries build and start", flush=True)
+    return gate
+
+
 def gate_benchmarks() -> Gate:
     """Rule 10: the benchmark harness re-runs and meets every threshold.
 
@@ -447,14 +502,67 @@ def gate_benchmarks() -> Gate:
         summary["divergence"]["max_benign_score"] < summary["divergence"]["threshold"],
         "a benign fixture scored above the divergence threshold",
     )
+    tla = summary["tla"]
+    gate.require(
+        tla["clean_runs"] > 0 and tla["clean_runs_clean"] == tla["clean_runs"],
+        f"TLA+ clean gates: {tla['clean_runs_clean']}/{tla['clean_runs']} were clean",
+    )
+    gate.require(
+        tla["min_clean_states"] >= summary["thresholds"]["min_tla_clean_states"],
+        f"TLA+ smallest clean run explored {tla['min_clean_states']} states",
+    )
+    gate.require(
+        tla["mutations_attempted"] > 0
+        and tla["mutations_caught"] == tla["mutations_attempted"],
+        f"TLA+ mutations caught {tla['mutations_caught']}/{tla['mutations_attempted']}",
+    )
+    gate.require(
+        tla["corrupted_config_refused"],
+        "the corrupted TLA+ configuration was not refused",
+    )
+    gate.require(
+        tla["unprotected_as_configured_violations"] >= 1,
+        "the unprotected TLA+ configuration produced no violation witness",
+    )
+    ebpf = summary["ebpf"]
+    gate.require(
+        ebpf["gate_passed"],
+        f"the eBPF equivalence gate failed ({ebpf['tests_failed']} test failures)",
+    )
+    gate.require(
+        ebpf["mutations_attempted"] > 0
+        and ebpf["mutations_caught"] == ebpf["mutations_attempted"],
+        f"eBPF mutations caught {ebpf['mutations_caught']}/{ebpf['mutations_attempted']}",
+    )
+    gate.require(
+        ebpf["clean_mismatches"] == 0,
+        f"the clean eBPF sweep reported {ebpf['clean_mismatches']} mismatches",
+    )
+    gate.require(
+        ebpf["clean_cases"] == ebpf["cases_per_verdict_sweep"] > 0,
+        f"the clean eBPF sweep ran {ebpf['clean_cases']} of {ebpf['cases_per_verdict_sweep']} cases",
+    )
     database = REPO_ROOT / "benchmarks" / "results" / "aegis_benchmarks.duckdb"
     parquet = REPO_ROOT / "benchmarks" / "results" / "aegis_benchmarks.parquet"
+    tla_parquet = REPO_ROOT / "benchmarks" / "results" / "aegis_tla_checks.parquet"
+    ebpf_parquet = (
+        REPO_ROOT / "benchmarks" / "results" / "aegis_ebpf_equivalence.parquet"
+    )
     gate.require(database.exists() and database.stat().st_size > 0, "no DuckDB output")
     gate.require(parquet.exists() and parquet.stat().st_size > 0, "no Parquet output")
+    gate.require(
+        tla_parquet.exists() and tla_parquet.stat().st_size > 0, "no TLA+ Parquet output"
+    )
+    gate.require(
+        ebpf_parquet.exists() and ebpf_parquet.stat().st_size > 0,
+        "no eBPF Parquet output",
+    )
     print(
         f"        recall {static['recall_count']}/9, fpr {static['false_positive_count']}/5, "
         f"compression {static['min_compression_ratio'] * 100:.2f}%+, "
-        f"chains {summary['chains']['blocked']}/{summary['chains']['malicious']}",
+        f"chains {summary['chains']['blocked']}/{summary['chains']['malicious']}, "
+        f"tla {tla['mutations_caught']}/{tla['mutations_attempted']} mutations, "
+        f"ebpf {ebpf['mutations_caught']}/{ebpf['mutations_attempted']} mutations",
         flush=True,
     )
     return gate
@@ -535,6 +643,7 @@ GATES = (
     gate_rust_tests,
     gate_python_tests,
     gate_portal_tests,
+    gate_service_binaries,
     gate_benchmarks,
     gate_deployment,
     gate_tree_clean,

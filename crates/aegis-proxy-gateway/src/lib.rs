@@ -6,7 +6,10 @@
 //! ## WHAT
 //! Stage 4's userspace half: a transparent JSON-RPC 2.0 / A2A proxy between an
 //! agent host and its MCP servers, plus the REST and SSE surface the web portal
-//! and the desktop and mobile clients consume.
+//! and the desktop and mobile clients consume. One binary also serves the
+//! embedded 3D command center, the FIDO2 approver PWA, the Cypher query
+//! endpoint, the OAuth 2.0 + PASETO authorization server, and metrics as both
+//! JSON and Prometheus text.
 //!
 //! ## WHY
 //! Rust, not Go or Python (ADR-010). The proxy runs on every single tool
@@ -26,13 +29,26 @@
 //! * [`taint_tracker`] -- the session high-water taint mark: `O(1)` per decision.
 //! * [`auth_fido2`] -- WebAuthn verification, including the strictly-increasing
 //!   counter that closes TV22.
+//! * [`oauth`] -- authorization code + PKCE (S256 only), RFC 6749 responses.
+//! * [`paseto`] -- v3.public access tokens: PAE, ECDSA P-256, validated claims.
+//! * [`cypher`] -- a bounded Cypher subset over a compressed DTG (FR-1.3).
+//! * [`metrics`] -- one counter list rendered as JSON and Prometheus text.
+//! * [`assets`] -- the command center, PWA, manifest, worker, and icons,
+//!   embedded at compile time so the served pages fetch nothing external.
+//! * [`random`] -- OS entropy, base64url and hex encodings of it.
 //! * [`grpc_bridge`] -- the typed contract to the Python ML service.
 //! * [`http`] -- the Axum surface, bound to loopback only.
 
+pub mod assets;
 pub mod auth_fido2;
+pub mod cypher;
 pub mod edit_automaton;
 pub mod grpc_bridge;
 pub mod http;
+pub mod metrics;
+pub mod oauth;
+pub mod paseto;
+pub mod random;
 pub mod taint_tracker;
 
 pub use edit_automaton::{

@@ -134,6 +134,21 @@ impl Default for RelyingParty {
     }
 }
 
+impl RelyingParty {
+    /// The relying party for the gateway's own loopback-served approver page.
+    ///
+    /// `localhost`, not `127.0.0.1`, because WebAuthn scopes `rpId` to a domain
+    /// and a browser treats the two spellings as different origins: pinning one
+    /// here would silently refuse every assertion a user made from the other.
+    pub fn loopback(port: u16) -> Self {
+        RelyingParty {
+            rp_id: "localhost".to_string(),
+            origin: format!("http://localhost:{port}"),
+            max_age_secs: 300,
+        }
+    }
+}
+
 /// A challenge awaiting an assertion.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingChallenge {
@@ -218,6 +233,20 @@ impl Fido2Verifier {
     /// The pending challenge for an id.
     pub fn pending(&self, challenge_id: &str) -> Option<&PendingChallenge> {
         self.pending.get(challenge_id)
+    }
+
+    /// The ids of every registered credential, for the ceremony's
+    /// `allowCredentials` list.
+    pub fn credential_ids(&self) -> Vec<String> {
+        self.credentials.keys().cloned().collect()
+    }
+
+    /// Removes a credential and returns it, for reconfiguration.
+    ///
+    /// The counter high-water mark travels with the credential, so changing the
+    /// relying party cannot silently reset the anti-replay state (TV22).
+    pub fn take_credential(&mut self, credential_id: &str) -> Option<RegisteredCredential> {
+        self.credentials.remove(credential_id)
     }
 
     /// Removes expired challenges. `O(challenges)`.

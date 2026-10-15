@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<!--
+  AegisCPG command center -- 3D view of the compressed Data Transformation Graph.
+
+  Author: Pratham Kapoor <prathamkapoor027@gmail.com>
+  Repository: github.com/PrathamKapoor (scheme omitted deliberately: this page
+  may reference no external origin, and the test suite enforces it)
+
+  WHAT: Renders the live DTG for a chosen server as a 3D constellation of data
+        states (nodes) and transforming functions (edges), streams every
+        enforcement decision over SSE, and runs Cypher-subset queries against
+        the same graph the verifier checked.
+
+  WHY:  Raw WebGL and zero external assets, deliberately. This page is served
+        by the binary that holds the capability table; a single <script src>
+        pointing at a CDN would hand a third party code execution inside the
+        control plane's origin. Everything this page needs is in this file and
+        the two /api endpoints it calls.
+
+  HOW:  Layered radial layout -- BFS depth from the taint sources becomes the
+        ring radius, the lattice level becomes the Z column, sinks are drawn
+        larger. Left panel: servers, metrics, sink inventory. Right panel:
+        live decision feed. Bottom: Cypher box over POST /api/cypher/query.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AegisCPG command center</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+         background: #05070c; color: #cbd5e1; overflow: hidden; }
+  #stage { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  .panel { position: fixed; background: rgba(8, 12, 20, .88); border: 1px solid #1e293b;
+           border-radius: 10px; padding: 12px 14px; backdrop-filter: blur(6px);
+           box-shadow: 0 8px 30px rgba(0,0,0,.55); }
+  #left { top: 14px; left: 14px; width: 300px; max-height: calc(100vh - 240px); overflow-y: auto; }
+  #right { top: 14px; right: 14px; width: 330px; max-height: calc(100vh - 240px); overflow-y: auto; }
+  #bottom { left: 14px; right: 14px; bottom: 14px; }
+  h1 { font-size: 14px; margin: 0 0 2px; color: #e2e8f0; letter-spacing: .04em; }
+  h2 { font-size: 11px; margin: 14px 0 6px; color: #64748b; text-transform: uppercase;
+       letter-spacing: .12em; }
+  a { color: #38bdf8; }
+  select, textarea, button, input { font: inherit; background: #0b1220; color: #e2e8f0;
+       border: 1px solid #1e293b; border-radius: 6px; padding: 6px 8px; width: 100%; }
+  button { cursor: pointer; border-color: #334155; }
+  button:hover { border-color: #38bdf8; }
+  textarea { min-height: 44px; resize: vertical; }
+  .row { display: flex; gap: 8px; align-items: center; margin: 4px 0; }
+  .row > * { flex: 1; }
+  .muted { color: #64748b; }
+  .kv { display: flex; justify-content: space-between; margin: 2px 0; }
+  .kv span:last-child { color: #e2e8f0; }
+  .chip { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px;
+          border: 1px solid #334155; margin: 1px 3px 1px 0; }
+  .feed { max-height: 320px; overflow-y: auto; }
+  .feed div { padding: 3px 0; border-bottom: 1px dotted #1e293b; word-break: break-all; }
+  .allow { color: #4ade80; } .suppress { color: #f87171; }
+  .modify { color: #fbbf24; } .step { color: #c084fc; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 3px 6px; border-bottom: 1px solid #1e293b;
+           max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  th { color: #64748b; font-weight: normal; }
+  #legend span { margin-right: 10px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+         margin-right: 4px; vertical-align: middle; }
+</style>
+</head>
+<body>
+<canvas id="stage" aria-label="3D Data Transformation Graph renderer"></canvas>
+
+<div class="panel" id="left">
+  <h1>AEGIS&middot;CPG <span class="muted">command center</span></h1>
+  <div class="muted" id="version">connecting&hellip;</div>
+
+  <h2>Server</h2>
+  <select id="server"><option value="">loading&hellip;</option></select>
+  <div class="muted" id="graphmeta">&nbsp;</div>
+
+  <h2>Runtime metrics</h2>
+  <div id="metrics">&nbsp;</div>
+
+  <h2>Detected sinks</h2>
+  <div id="sinks" class="muted">none loaded</div>
+
+  <h2>Legend</h2>
+  <div id="legend">
+    <span><i class="dot" style="background:#38bdf8"></i>PUBLIC</span>
+    <span><i class="dot" style="background:#a3e635"></i>INTERNAL</span>
+    <span><i class="dot" style="background:#fbbf24"></i>CONFIDENTIAL</span>
+    <span><i class="dot" style="background:#f87171"></i>SECRET</span>
+  </div>
+
+  <h2>Selected</h2>
+  <div id="selected" class="muted">click a node</div>
+</div>
+
+<div class="panel" id="right">
+  <h2>Live decisions <span class="muted">(SSE)</span></h2>
+  <div class="feed" id="feed"></div>
+</div>
+
+<div class="panel" id="bottom">
+  <div class="row">
+    <textarea id="query" spellcheck="false">MATCH (a:source)-[*1..3]->(b:sink) RETURN a.id, b.node_type, b.label LIMIT 25</textarea>
+    <button id="run" style="max-width:110px">Run Cypher</button>
+  </div>
+  <div id="results" class="muted">The subset: MATCH (n:label {prop: 'v'})-[r:kind*1..3]-&gt;(m) WHERE r.prop = v RETURN n.p, count(*) LIMIT n. The 3-hop bound is enforced.</div>
+</div>
+
+<script>
+"use strict";
+// ---------------------------------------------------------------------------
+// Linear algebra: just enough for a look-at camera.
+// ---------------------------------------------------------------------------
+function mat4() { return new Float32Array(16); }
+function identity(m) { m.fill(0); m[0] = m[5] = m[10] = m[15] = 1; return m; }
+function perspective(m, fovy, aspect, near, far) {
+  const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+  identity(m);
+  m[0] = f / aspect; m[5] = f; m[10] = (far + near) * nf; m[11] = -1;
+  m[14] = 2 * far * near * nf; m[15] = 0;
+  return m;
+}
+function lookAt(m, eye, center, up) {
+  let zx = eye[0]-center[0], zy = eye[1]-center[1], zz = eye[2]-center[2];
+  let len = Math.hypot(zx, zy, zz) || 1; zx/=len; zy/=len; zz/=len;
+  let xx = up[1]*zz - up[2]*zy, xy = up[2]*zx - up[0]*zz, xz = up[0]*zy - up[1]*zx;
+  len = Math.hypot(xx, xy, xz) || 1; xx/=len; xy/=len; xz/=len;
+  const yx = zy*xz - zz*xy, yy = zz*xx - zx*xz, yz = zx*xy - zy*xx;
+  m[0]=xx; m[1]=yx; m[2]=zx; m[3]=0;
+  m[4]=xy; m[5]=yy; m[6]=zy; m[7]=0;
+  m[8]=xz; m[9]=yz; m[10]=zz; m[11]=0;
+  m[12]=-(xx*eye[0]+xy*eye[1]+xz*eye[2]);
+  m[13]=-(yx*eye[0]+yy*eye[1]+yz*eye[2]);
+  m[14]=-(zx*eye[0]+zy*eye[1]+zz*eye[2]);
+  m[15]=1;
+  return m;
+}
+function multiply(out, a, b) {
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+    out[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+  }
+  return out;
+}
+function project(mvp, p) {
+  const x = mvp[0]*p[0] + mvp[4]*p[1] + mvp[8]*p[2] + mvp[12];
+  const y = mvp[1]*p[0] + mvp[5]*p[1] + mvp[9]*p[2] + mvp[13];
+  const w = mvp[3]*p[0] + mvp[7]*p[1] + mvp[11]*p[2] + mvp[15];
+  return [x / w, y / w, w];
+}
+
+// ---------------------------------------------------------------------------
+// WebGL bootstrap.
+// ---------------------------------------------------------------------------
+const canvas = document.getElementById("stage");
+const gl = canvas.getContext("webgl", { antialias: true, alpha: false });
+if (!gl) { document.getElementById("graphmeta").textContent = "WebGL unavailable in this browser"; }
+
+const VS = `
+attribute vec3 aPos; attribute vec3 aColor; attribute float aSize;
+uniform mat4 uMvp; uniform float uPointScale;
+varying vec3 vColor;
+void main() {
+  gl_Position = uMvp * vec4(aPos, 1.0);
+  gl_PointSize = aSize * uPointScale;
+  vColor = aColor;
+}`;
+const FS = `
+precision mediump float;
+varying vec3 vColor;
+void main() {
+  gl_FragColor = vec4(vColor, 1.0);
+}`;
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const program = gl.createProgram();
+gl.attachShader(program, compile(gl.VERTEX_SHADER, VS));
+gl.attachShader(program, compile(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(program);
+if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
+gl.useProgram(program);
+
+const loc = {
+  pos: gl.getAttribLocation(program, "aPos"),
+  color: gl.getAttribLocation(program, "aColor"),
+  size: gl.getAttribLocation(program, "aSize"),
+  mvp: gl.getUniformLocation(program, "uMvp"),
+  pointScale: gl.getUniformLocation(program, "uPointScale"),
+};
+
+function buffer(data, target) {
+  const b = gl.createBuffer();
+  gl.bindBuffer(target, b);
+  gl.bufferData(target, data, gl.STATIC_DRAW);
+  return b;
+}
+
+// ---------------------------------------------------------------------------
+// Scene state.
+// ---------------------------------------------------------------------------
+const LATTICE_COLOR = {
+  PUBLIC:       [0.22, 0.74, 0.97],
+  INTERNAL:     [0.64, 0.90, 0.21],
+  CONFIDENTIAL: [0.98, 0.75, 0.14],
+  SECRET:       [0.97, 0.44, 0.44],
+};
+const LATTICE_Z = { PUBLIC: -1.2, INTERNAL: -0.4, CONFIDENTIAL: 0.4, SECRET: 1.2 };
+
+let scene = { nodes: [], edges: [], nodePositions: [], pointBuf: null, lineBuf: null, server: "" };
+let camera = { yaw: 0.6, pitch: 0.45, distance: 9 };
+let dragging = null;
+let lastMvp = mat4();
+
+function layout(nodes, edges) {
+  // BFS depth from taint sources (undirected), then a radial ring per depth.
+  const byId = new Map(nodes.map((n, i) => [n.id, i]));
+  const adjacency = nodes.map(() => []);
+  for (const e of edges) {
+    const a = byId.get(e.source), b = byId.get(e.target);
+    if (a === undefined || b === undefined) continue;
+    adjacency[a].push(b); adjacency[b].push(a);
+  }
+  const depth = new Array(nodes.length).fill(-1);
+  const queue = [];
+  nodes.forEach((n, i) => {
+    if (["tool_input_param", "env_secret"].includes(n.node_type)) { depth[i] = 0; queue.push(i); }
+  });
+  if (!queue.length) { nodes.forEach((_, i) => { depth[i] = 0; queue.push(i); }); }
+  for (let q = 0; q < queue.length; q++) {
+    for (const next of adjacency[queue[q]]) if (depth[next] < 0) { depth[next] = Math.min(3, depth[queue[q]] + 1); queue.push(next); }
+  }
+  const rings = new Map();
+  nodes.forEach((_, i) => {
+    const d = depth[i] < 0 ? 3 : depth[i];
+    if (!rings.has(d)) rings.set(d, []);
+    rings.get(d).push(i);
+  });
+  const positions = new Array(nodes.length);
+  for (const [d, members] of [...rings.entries()].sort((a, b) => a[0] - b[0])) {
+    const radius = d === 0 ? 0.55 : 0.6 + d * 1.35;
+    members.forEach((index, k) => {
+      const angle = (k / members.length) * Math.PI * 2 + d * 0.5;
+      positions[index] = [
+        Math.cos(angle) * radius,
+        Math.sin(angle) * radius * 0.82,
+        LATTICE_Z[nodes[index].lattice] ?? 0,
+      ];
+    });
+  }
+  return positions;
+}
+
+function buildScene(graph) {
+  const nodes = graph.nodes || [], edges = graph.edges || [];
+  const positions = layout(nodes, edges);
+  const points = [];
+  nodes.forEach((n, i) => {
+    const color = LATTICE_COLOR[n.lattice] || LATTICE_COLOR.PUBLIC;
+    const size = ["process_sink", "network_socket", "return_payload"].includes(n.node_type) ? 14 : 7;
+    points.push(...positions[i], color[0], color[1], color[2], size);
+  });
+  const byId = new Map(nodes.map((n, i) => [n.id, i]));
+  const lines = [];
+  for (const e of edges) {
+    const a = byId.get(e.source), b = byId.get(e.target);
+    if (a === undefined || b === undefined) continue;
+    const color = LATTICE_COLOR[nodes[a].lattice] || LATTICE_COLOR.PUBLIC;
+    lines.push(...positions[a], color[0], color[1], color[2]);
+    lines.push(...positions[b], color[0], color[1], color[2]);
+  }
+  scene = { nodes, edges, positions, server: graph.server_id, pointBuf: null, lineBuf: null };
+  if (gl) {
+    scene.pointBuf = buffer(new Float32Array(points), gl.ARRAY_BUFFER);
+    scene.lineBuf = lines.length ? buffer(new Float32Array(lines), gl.ARRAY_BUFFER) : null;
+  }
+  camera.distance = 5 + Math.max(2, Math.sqrt(nodes.length) * 1.6);
+
+  const sinks = graph.detected_sinks || [];
+  document.getElementById("sinks").innerHTML = sinks.length
+    ? sinks.map(s => `<div class="kv"><span>${s.sink_kind}</span><span class="muted">hop ${s.hop_depth} &middot; line ${s.line}</span></div>`).join("")
+    : "<span class='muted'>no sinks within the 3-hop bound</span>";
+  document.getElementById("graphmeta").textContent =
+    `${nodes.length} nodes \u00b7 ${edges.length} edges \u00b7 ratio ${(graph.compression_ratio * 100).toFixed(1)}%`;
+}
+
+function draw() {
+  requestAnimationFrame(draw);
+  if (!gl) return;
+  const width = canvas.clientWidth, height = canvas.clientHeight;
+  if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; }
+  gl.viewport(0, 0, width, height);
+  gl.clearColor(0.02, 0.03, 0.05, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  const eye = [
+    Math.cos(camera.yaw) * Math.cos(camera.pitch) * camera.distance,
+    Math.sin(camera.pitch) * camera.distance,
+    Math.sin(camera.yaw) * Math.cos(camera.pitch) * camera.distance,
+  ];
+  const proj = perspective(mat4(), Math.PI / 4, width / Math.max(1, height), 0.1, 100);
+  const view = lookAt(mat4(), eye, [0, 0, 0], [0, 1, 0]);
+  const mvp = multiply(mat4(), proj, view);
+  lastMvp = mvp;
+  gl.uniformMatrix4fv(loc.mvp, false, mvp);
+  gl.uniform1f(loc.pointScale, Math.max(1, 480 / width) * 1.6);
+
+  if (scene.lineBuf) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, scene.lineBuf);
+    gl.enableVertexAttribArray(loc.pos);
+    gl.vertexAttribPointer(loc.pos, 3, gl.FLOAT, false, 28, 0);
+    gl.enableVertexAttribArray(loc.color);
+    gl.vertexAttribPointer(loc.color, 3, gl.FLOAT, false, 28, 12);
+    gl.disableVertexAttribArray(loc.size);
+    gl.vertexAttrib1f(loc.size, 1.0);
+    gl.drawArrays(gl.LINES, 0, scene.edges.length * 2);
+  }
+  if (scene.pointBuf) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, scene.pointBuf);
+    gl.enableVertexAttribArray(loc.pos);
+    gl.vertexAttribPointer(loc.pos, 3, gl.FLOAT, false, 28, 0);
+    gl.enableVertexAttribArray(loc.color);
+    gl.vertexAttribPointer(loc.color, 3, gl.FLOAT, false, 28, 12);
+    gl.enableVertexAttribArray(loc.size);
+    gl.vertexAttribPointer(loc.size, 1, gl.FLOAT, false, 28, 24);
+    gl.drawArrays(gl.POINTS, 0, scene.nodes.length);
+  }
+}
+if (gl) draw();
+
+// Camera interaction: drag orbits, wheel zooms, double click resets.
+canvas.addEventListener("mousedown", e => { dragging = { x: e.clientX, y: e.clientY }; });
+window.addEventListener("mouseup", () => { dragging = null; });
+window.addEventListener("mousemove", e => {
+  if (!dragging) return;
+  camera.yaw += (e.clientX - dragging.x) * 0.008;
+  camera.pitch = Math.max(-1.4, Math.min(1.4, camera.pitch + (e.clientY - dragging.y) * 0.008));
+  dragging = { x: e.clientX, y: e.clientY };
+});
+canvas.addEventListener("wheel", e => {
+  e.preventDefault();
+  camera.distance = Math.max(2, Math.min(60, camera.distance * (1 + Math.sign(e.deltaY) * 0.08)));
+}, { passive: false });
+canvas.addEventListener("dblclick", () => { camera = { yaw: 0.6, pitch: 0.45, distance: camera.distance }; });
+canvas.addEventListener("click", e => {
+  if (!scene.positions.length) return;
+  const rect = canvas.getBoundingClientRect();
+  const x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  const y = 1 - ((e.clientY - rect.top) / rect.height) * 2;
+  let best = null, bestDistance = 0.06;
+  scene.positions.forEach((p, i) => {
+    const [px, py] = project(lastMvp, p);
+    const d = Math.hypot(px - x, py - y);
+    if (d < bestDistance) { bestDistance = d; best = i; }
+  });
+  const panel = document.getElementById("selected");
+  if (best === null) { panel.textContent = "click a node"; return; }
+  const n = scene.nodes[best];
+  panel.innerHTML = `<div class="kv"><span>id</span><span>${n.id}</span></div>` +
+    `<div class="kv"><span>label</span><span>${n.label}</span></div>` +
+    `<div class="kv"><span>type</span><span>${n.node_type}</span></div>` +
+    `<div class="kv"><span>lattice</span><span>${n.lattice}</span></div>` +
+    `<div class="kv"><span>origin</span><span>${n.file_path}:${n.line}</span></div>`;
+});
+
+// ---------------------------------------------------------------------------
+// Data: servers, graph, metrics, SSE feed, cypher.
+// ---------------------------------------------------------------------------
+async function loadServers() {
+  const select = document.getElementById("server");
+  try {
+    const payload = await (await fetch("/api/servers")).json();
+    const servers = payload.servers || [];
+    if (!servers.length) {
+      select.innerHTML = "<option value=''>no graphs loaded (set AEGIS_GRAPHS)</option>";
+      return;
+    }
+    select.innerHTML = servers.map(s =>
+      `<option value="${s.server_id}">${s.server_id} (${s.tool_count} tools)</option>`).join("");
+    select.onchange = () => loadGraph(select.value);
+    await loadGraph(servers[0].server_id);
+  } catch (error) {
+    select.innerHTML = `<option value=''>discovery failed: ${error}</option>`;
+  }
+}
+
+async function loadGraph(serverId) {
+  const response = await fetch(`/api/graph/${encodeURIComponent(serverId)}`);
+  if (!response.ok) {
+    document.getElementById("graphmeta").textContent = await response.text();
+    return;
+  }
+  buildScene(await response.json());
+}
+
+async function pollMetrics() {
+  try {
+    const m = await (await fetch("/api/metrics")).json();
+    document.getElementById("version").textContent =
+      `${m.product} ${m.version} \u00b7 up ${m.uptime_seconds}s`;
+    const keys = ["rpc_requests_total", "rpc_allowed_total", "rpc_suppressed_total",
+      "step_ups_required_total", "approvals_recorded_total", "cypher_queries_total",
+      "sse_connections_total", "oauth_tokens_total"];
+    document.getElementById("metrics").innerHTML = keys
+      .map(k => `<div class="kv"><span>${k.replace(/_total$/, "")}</span><span>${m[k]}</span></div>`)
+      .join("");
+  } catch { /* the feed stays live even when one poll fails */ }
+}
+
+function connectFeed() {
+  const feed = document.getElementById("feed");
+  const source = new EventSource("/api/events");
+  source.addEventListener("decision", event => {
+    const data = JSON.parse(event.data);
+    const kind = data.detail && data.detail.enforcement ? data.detail.enforcement : data.kind;
+    const line = document.createElement("div");
+    line.className = /allow/.test(kind) ? "allow" : /suppress|deny|reject/.test(kind) ? "suppress" : "modify";
+    line.textContent = `#${data.seq} ${data.kind} ${kind} ${JSON.stringify(data.detail).slice(0, 120)}`;
+    feed.prepend(line);
+    while (feed.childNodes.length > 60) feed.removeChild(feed.lastChild);
+  });
+  source.onerror = () => { /* EventSource reconnects by itself */ };
+}
+
+document.getElementById("run").addEventListener("click", async () => {
+  const results = document.getElementById("results");
+  const serverId = document.getElementById("server").value;
+  if (!serverId) { results.textContent = "no server selected"; return; }
+  results.textContent = "running\u2026";
+  try {
+    const response = await fetch("/api/cypher/query", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ server_id: serverId, query: document.getElementById("query").value }),
+    });
+    const payload = await response.json();
+    if (!response.ok) { results.textContent = `error: ${payload.error}`; return; }
+    if (!payload.rows.length) { results.textContent = `0 rows (${payload.elapsed_us} \u00b5s)`; return; }
+    const head = payload.columns.map(c => `<th>${c}</th>`).join("");
+    const body = payload.rows.map(row =>
+      `<tr>${payload.columns.map(c => `<td>${String(row[c] ?? "")}</td>`).join("")}</tr>`).join("");
+    results.innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>` +
+      `<div class="muted" style="margin-top:6px">${payload.rows.length} rows \u00b7 ` +
+      `${payload.truncated ? "truncated " : ""}${payload.elapsed_us} \u00b5s \u00b7 graph ${payload.graph_sha256.slice(0, 12)}\u2026</div>`;
+  } catch (error) {
+    results.textContent = `request failed: ${error}`;
+  }
+});
+
+loadServers();
+pollMetrics();
+setInterval(pollMetrics, 2000);
+connectFeed();
+</script>
+</body>
+</html>

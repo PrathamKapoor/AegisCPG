@@ -116,7 +116,7 @@ Stage 4 enforces but has no semantics to enforce.
  │ STAGE 3  crates/aegis-smt-verifier + aegis_ml/milp_privilege_cut.py       │  ││
  │   DTS (denial-of-transitive-sink) + lattice solver (pure Rust) ─┐         │  ││
  │   Z3 SMT-LIBv2 subprocess (if on PATH) ────────────────────────┼──┐      │  ││
- │   TLA+ TLC replay of specs/MCPShieldLTS.tla ──────────────────┼──┼──┐   │  ││
+ │   TLA+ BFS model check: check-tla (ADR-020) ──────────────────┼──┼──┐   │  ││
  │                                                              │  │  │   │  ││
  │        UNSAT ⇒ all 4 properties hold                         │  │  │   │  ││
  │        SAT   ⇒ CounterexampleTrace {violated_property,        │  │  │   │  ││
@@ -133,10 +133,10 @@ Stage 4 enforces but has no semantics to enforce.
                                                                            │  ││
  ┌─────────────────────────────────────────────────────────────────────────┼──┼┼┐
  │ STAGE 4a  crates/aegis-ebpf-loader  → BPF map entries (Linux)           │  ││
- │   cgroup_policy_map, allowed_exec_hash_map, allowed_path_lpm_map,        │  ││
+ │   cgroup_policy_map, allowed_exec_inode_map, allowed_path_lpm_map,       │  ││
  │   audit_ringbuf  ←  lsm_enforcer.bpf.c  (SEC("lsm/*"))                 │  ││
  │ Stage 4b  crates/aegis-proxy-gateway → Edit Automaton γ(q,λ)  (any OS)  ◄┘  ││
- │   Axum :8080  POST /mcp/rpc, /api/audit, /api/graph/:id, SSE, /fido2      ││
+ │   Axum :8080  /mcp/rpc /api/graph /api/cypher /metrics SSE /fido2 /oauth  ││
  └──────────────────────────────────────────────────────────────────────────┘│
  └──────────────────────────────────────────────────────────────────────────┘
 ```
@@ -392,9 +392,10 @@ $$\mathcal{LTS} = (\Sigma,\ \Sigma_0,\ \Lambda,\ \to)$$
 
 $$H(\text{def}_i(t)) \parallel H(\mathcal{D}_i(t)) \;=\; H(\text{def}_{approved}(t)) \parallel H(\mathcal{D}_{approved}(t))$$
 
-Checked structurally in Rust and independently re-checked by TLC's
-`ToolIntegrityInvariant`. A mismatch is exactly TV5 (rug pull) or TV6 (version
-rollback), and is reported with the first differing `(tool_id, node_id)`.
+Checked structurally in Rust and independently re-checked by the native model
+checker's `ToolIntegrityInvariant` (`aegis-cli check-tla`, ADR-020). A mismatch
+is exactly TV5 (rug pull) or TV6 (version rollback), and is reported with the
+first differing `(tool_id, node_id)`.
 
 ### 4.4 Property 2 — Data Confinement
 
@@ -412,7 +413,19 @@ $$\text{eff}(\sigma_i, a) \subseteq \text{cap}(a) \cap \bigcup_{t \in \text{acti
 
 $$\forall\, s_i \neq s_j:\ \neg\texttt{bridged}(s_i,s_j)\ \Longrightarrow\ \text{shared}(\mathcal{K}(s_i),\mathcal{K}(s_j)) = \varnothing$$
 
-### 4.7 Dynamic reflection is fail-closed, not guessed
+### 4.7 How the TLA+ gate is executed (ADR-020 / ADR-021)
+
+`aegis-cli check-tla` loads `specs/MCPShieldLTS.tla` with either shipped `.cfg`
+and runs an exhaustive BFS over the quotient of the state space by
+trace-independence (ADR-021), so termination is structural and the first
+counterexample reported is a shortest one. Measured by
+`benchmarks/run_all_benchmarks.py --suite tla`: **486 states, zero violations**
+under the reference monitor on the unprotected configuration; **1134 states**
+clean on the protected one; the unprotected configuration taken as configured
+yields a violation witness; four guard-removal mutations are each caught against
+their named invariant; a corrupted `.cfg` is refused before any checking.
+
+### 4.8 Dynamic reflection is fail-closed, not guessed
 
 Any unresolvable dynamic dispatch yields `SinkKind::UnboundedDynamic`. Stage 3
 translates this into a **hard** constraint: the tool's TACR *must not* carry
@@ -421,7 +434,7 @@ translates this into a **hard** constraint: the tool's TACR *must not* carry
 AegisCPG moves the decision to the kernel, where it is decided synchronously in
 0.04 ms (ADR-005).
 
-### 4.8 OR-Tools MILP — minimum-cut capability synthesis
+### 4.9 OR-Tools MILP — minimum-cut capability synthesis
 
 $$\min_{x}\ \sum_{c\in\mathcal{C}} r_c\, x_c \qquad \text{s.t.}$$
 
@@ -438,7 +451,7 @@ block of the TACR, and $\sum_c r_c - \sum_c r_c x_c$ is the reported
 
 ## Flow 5 — Inline JSON-RPC 2.0 / A2A Edit-Automaton Gateway
 
-**Module:** `crates/aegis-proxy-gateway` (`edit_automaton.rs`, `taint_tracker.rs`)
+**Module:** `crates/aegis-proxy-gateway` (`edit_automaton.rs`, `taint_tracker.rs`, `http.rs`, `auth_fido2.rs`, `oauth.rs`, `paseto.rs`, `cypher.rs`, `metrics.rs`, `assets.rs`)
 
 ### 5.1 WHAT
 
@@ -507,7 +520,7 @@ Now the *same session* calls `send_webhook` on a PUBLIC server:
               "aegis":{"status":"step_up_required","challenge_id":"cf_9a1e"} }
         │  (execution is *suspended*, not dropped — Temporal resumes it)
         ▼
-   POST /api/fido2/approve  {challenge_id, webauthn_assertion}
+   POST /fido2/verify  {challenge_id, webauthn_assertion}
         │  verify ES256 signature over
         │    SHA256(challenge_id ‖ agent_id ‖ datum_hash ‖ target ‖ expiry)
         │  + verify origin RP ID hash + counter monotonicity (replay, TV22)
@@ -596,17 +609,33 @@ CEF:0|AegisCPG|KernelLSM|1.0|100|DENY_EXECVE|src=10.4.2.7 dst=203.0.113.9
   cs1Label=comm cs1=sh cs2Label=target cs2=/bin/sh act=block
 ```
 
-### 6.5 Windows/WSL2 host testing
+### 6.5 Windows/ARM64 host execution
 
-The same LPM-trie and cgroup-hash lookup logic is re-implemented as a deterministic
-userspace simulator (`policy_compiler.rs::KernelLsmSimulator`) so `cargo test` runs
-on the Windows dev host and asserts the **identical** decision table.
+The kernel cannot load BPF here, but the *decision procedure* executes natively.
+Three independent implementations of the same table run on the dev host, and
+`crates/aegis-ebpf-loader/tests/shim_equivalence.rs` requires every one of the
+24 scenario verdicts to agree across all three:
+
+* `ebpf-probes/lsm_enforcer.bpf.c` compiled as native aarch64 C by the in-repo
+  LLVM through `ebpf-probes/aegis_userspace_shim.c` (the same hooks, dual-mode
+  behind `AEGIS_USERSPACE_SHIM`), executed as a freestanding binary that prints
+  a machine-readable report;
+* `policy_compiler.rs::KernelLsmSimulator`, the Rust reference decision table
+  the C is written against;
+* `bpf_vm.rs`, the RFC 9669 verifier/compiler/VM executing assembly encodings
+  of the same programs, with its own negative tests (bad jump offsets, unbounded
+  loops, stack overruns, uninitialised reads).
+
+Five fail-open mutations of the C source -- one per security check, each a
+plausible edit -- must each be caught by the harness's own self-check and named
+in its report; `benchmarks/run_all_benchmarks.py --suite ebpf` re-runs the whole
+gate and records the per-build diagnostics.
 
 ---
 
 ## Flow 7 — Temporal Durable Step-Up Workflow & WebAuthn/FIDO2
 
-**Modules:** `workflows/temporal_orchestrator/*`, `apps/desktop-firewall`, `apps/mobile-approver`
+**Modules:** `workflows/temporal_orchestrator/*`, `crates/aegis-desktop-core` + `apps/desktop-firewall` (the compiled workspace binary; the Tauri webview in `apps/desktop-firewall/gui` is an excluded thin shell), the gateway's `/mobile` FIDO2 PWA (`crates/aegis-proxy-gateway/src/assets.rs`), and `apps/mobile-approver` (the Flutter reference view).
 
 ### 7.1 WHAT
 
@@ -617,7 +646,7 @@ must never be silently auto-approved.
 ### 7.2 Sequence
 
 ```
-Gateway        Temporal        Postgres/Timescale   Tauri tray   Flutter phone
+Gateway        Temporal        Postgres/Timescale   tray/CLI     approval PWA 
    │               │                    │                  │             │
    │ Suspend(ToolsCall, cf_9a1e)       │                    │             │
    ├──────────────►│ start_workflow(McpDeclassificationWorkflow)       │

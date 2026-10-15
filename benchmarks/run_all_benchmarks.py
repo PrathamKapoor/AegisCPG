@@ -6,8 +6,12 @@ hand. This harness exists so that none of them has to be.
 WHAT
     Runs the compiled `aegis-cli.exe` over the 14 shipped fixtures and the 50
     compositional exfiltration chains, runs the real divergence model and the
-    real retriever over the results, and writes the measurements to three
-    formats: DuckDB, Parquet, and a JSON summary.
+    real retriever over the results, model-checks the shipped TLA+ specification
+    through `aegis-cli check-tla`, and drives the real eBPF three-way
+    equivalence gate (the freestanding C hooks, the Rust simulator, the RFC 9669
+    VM) over its 24-case table. The measurements go to three formats: DuckDB,
+    Parquet, and a JSON summary; the TLA+ and eBPF tables get their own Parquet
+    files beside the union one.
 
 WHY THE CLI IS INVOKED RATHER THAN REIMPLEMENTED
     The extractor is 2400 lines of Rust with a hop-bounded taint propagation
@@ -30,6 +34,8 @@ HOW
       rag       the RAG ablation              -> nDCG hybrid vs dense-only
       divergence the ONNX model over each DTG -> AUC-equivalent separation
       latency   per-stage timings             -> medians and percentiles
+      tla       check-tla over the LTS        -> reachable states, mutation witnesses
+      ebpf      the C hooks and both Rust models -> 24-case three-way verdicts
 
     It then writes `benchmarks/results/{summary_metrics.json,
     aegis_benchmarks.duckdb, aegis_benchmarks.parquet}` and asserts the
@@ -45,6 +51,7 @@ from __future__ import annotations
 import argparse
 import json
 import platform
+import re
 import subprocess
 import statistics
 import sys
@@ -60,6 +67,41 @@ LAB_DIR = FIXTURES_DIR / "vulnerable-lab"
 CHAINS_DIR = FIXTURES_DIR / "mcptox_chains"
 RESULTS_DIR = BENCHMARKS_DIR / "results"
 
+#: The formal model the `tla` suite checks, and the two shipped configurations:
+#: the unprotected toolchain (expected to expose violations) and the
+#: AegisCPG-protected one (expected to be clean under its own guards and under
+#: the reference-monitor override).
+SPECS_DIR = REPO_ROOT / "specs"
+TLA_SPEC = SPECS_DIR / "MCPShieldLTS.tla"
+TLA_UNPROTECTED_CFG = SPECS_DIR / "MCPShieldLTS.cfg"
+TLA_SAFE_CFG = SPECS_DIR / "MCPShieldLTS.safe.cfg"
+
+#: The four guard-removal mutations the checker must catch, each paired with
+#: the MCPShield property it must then observe being violated.
+TLA_MUTATIONS: list[tuple[str, str]] = [
+    ("allow-mutated-hash-execution", "ToolIntegrityInvariant"),
+    ("allow-unapproved-cross-domain-write", "DataConfinementInvariant"),
+    ("allow-unbounded-capability-call", "PrivilegeBoundednessInvariant"),
+    ("allow-unbridged-context-bleed", "ContextIsolationInvariant"),
+]
+
+#: Where `cargo test --package aegis-ebpf-loader` leaves the shim builds: the
+#: clean one plus the five mutation builds the equivalence gate produces.
+EBPF_SHIM_DIR = REPO_ROOT / "target" / "shim-equivalence"
+EBPF_MUTATION_BUILDS = [
+    "mut-m1-registry-fail-open",
+    "mut-m2-file-open-fail-open",
+    "mut-m3-owner-check-dropped",
+    "mut-m4-read-write-gate",
+    "mut-m5-socket-no-policy",
+]
+#: The pinned scenario table the C harness runs.
+EBPF_CASES = 24
+
+#: `aegis-cli` exit codes, so a suite can assert the gate the CLI declared.
+EXIT_OK = 0
+EXIT_VIOLATIONS = 1
+
 #: The decision threshold the gateway applies to a divergence score.
 DIVERGENCE_THRESHOLD = 0.5
 
@@ -73,6 +115,7 @@ THRESHOLDS = {
     "max_benign_score": 0.05,
     "min_benign_fixture_score_ceiling": 0.05,
     "max_end_to_end_scoring_ms": 15.0,
+    "min_tla_clean_states": 200,
 }
 
 
@@ -186,6 +229,59 @@ class LatencyRow:
     median: float
     p95: float
     samples: int
+
+
+@dataclass
+class TlaRow:
+    """One `aegis-cli check-tla` run over the shipped LTS."""
+
+    run_id: str
+    kind: str
+    config: str
+    mode: str
+    mutation_id: str
+    target_invariant: str
+    expected_outcome: str
+    observed_outcome: str
+    exit_code: int
+    distinct_states: int
+    transitions_evaluated: int
+    transitions_taken: int
+    deepest_trace: int
+    violations: int
+    first_violation: str
+    first_violation_depth: int
+    limits_hit: bool
+    duration_ms: float
+    passed: bool
+
+
+@dataclass
+class EbpfRow:
+    """One shim build's execution of the 24-case scenario table.
+
+    The *clean* build is the equivalence sweep -- every case verdict is also
+    replayed through the Rust simulator and the RFC 9669 VM by the cargo gate
+    this suite runs first. Each *mutation* build is a fail-open edit that the
+    harness's own self-check must catch (non-zero exit, MISMATCH lines).
+    """
+
+    variant: str
+    kind: str
+    exit_code: int
+    map_policy: int
+    map_lpm: int
+    map_net: int
+    map_exec: int
+    cases: int
+    events: int
+    allows: int
+    denies: int
+    mismatches: int
+    selftest_ok: bool
+    executable_bytes: int
+    duration_ms: float
+    passed: bool
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +572,398 @@ def run_latency_suite() -> list[LatencyRow]:
 
 
 # ---------------------------------------------------------------------------
+# TLA+ model checking
+# ---------------------------------------------------------------------------
+def run_cli(arguments: Sequence[str], timeout: float = 300.0) -> subprocess.CompletedProcess:
+    """One `aegis-cli` invocation, captured.
+
+    A non-zero exit is a measurement, not an exception: the negative gates
+    (mutations, corrupted configurations) are *supposed* to exit non-zero, and
+    the exit code is one of the columns.
+    """
+    return subprocess.run(
+        [str(CLI), *arguments], capture_output=True, text=True, timeout=timeout
+    )
+
+
+def _tla_check(
+    run_id: str,
+    kind: str,
+    config: Path,
+    mode: str,
+    mutation_id: str,
+    target_invariant: str,
+    expected: str,
+    arguments: Sequence[str],
+    stderr_needle: str = "",
+) -> TlaRow:
+    """Runs `check-tla --json` once and turns its report into a row."""
+    completed = run_cli(
+        ["check-tla", "--spec", str(TLA_SPEC), "--config", str(config), "--json", *arguments]
+    )
+    document = None
+    if completed.stdout.strip():
+        try:
+            document = json.loads(completed.stdout)
+        except json.JSONDecodeError:
+            document = None
+
+    if document is None:
+        # Only the corrupted-configuration run may fail before a report exists.
+        # The row records the refusal; whether it was the *right* refusal is
+        # the `passed` column.
+        return TlaRow(
+            run_id=run_id,
+            kind=kind,
+            config=config.name,
+            mode=mode,
+            mutation_id=mutation_id,
+            target_invariant=target_invariant,
+            expected_outcome=expected,
+            observed_outcome="refused",
+            exit_code=completed.returncode,
+            distinct_states=0,
+            transitions_evaluated=0,
+            transitions_taken=0,
+            deepest_trace=0,
+            violations=0,
+            first_violation="",
+            first_violation_depth=0,
+            limits_hit=False,
+            duration_ms=0.0,
+            passed=(
+                expected == "refused"
+                and completed.returncode != EXIT_OK
+                and bool(stderr_needle)
+                and stderr_needle in completed.stderr
+            ),
+        )
+
+    violations = document["violations"]
+    first = violations[0] if violations else None
+    observed = "clean" if not violations else "violations"
+    # `check-tla` is a gate: exit 0 means the observed outcome matched the
+    # expectation. A mutation that is caught is a *pass with exit 0*; catching
+    # nothing exits 1.
+    passed = observed == expected and completed.returncode == EXIT_OK
+    if mutation_id:
+        passed = passed and first is not None and first["invariant"] == target_invariant
+    return TlaRow(
+        run_id=run_id,
+        kind=kind,
+        config=config.name,
+        mode=mode,
+        mutation_id=mutation_id,
+        target_invariant=target_invariant,
+        expected_outcome=expected,
+        observed_outcome=observed,
+        exit_code=completed.returncode,
+        distinct_states=int(document["distinct_states_explored"]),
+        transitions_evaluated=int(document["transitions_evaluated"]),
+        transitions_taken=int(document["transitions_taken"]),
+        deepest_trace=int(document["deepest_trace"]),
+        violations=len(violations),
+        first_violation=first["invariant"] if first else "",
+        first_violation_depth=int(first["depth"]) if first else 0,
+        limits_hit=bool(document["limits_hit"]),
+        duration_ms=round(float(document["duration_ms"]), 4),
+        passed=passed,
+    )
+
+
+def run_tla_suite() -> list[TlaRow]:
+    """Model-check the shipped LTS: three clean gates, one unprotected
+    configuration, four mutations, and one corrupted configuration.
+
+    The clean gates mirror the positive halves of the proof obligation: the
+    unprotected `.cfg` under the reference-monitor override, and the protected
+    `.cfg` both as configured and under the override. Each carries
+    `--min-states`, so the binary itself refuses a trivial state space; the
+    mutations then remove one guard at a time and must each expose exactly the
+    property that guard implements. The corrupted configuration renames an
+    invariant in the `.cfg`; the loader must reject it before any checking.
+    """
+    rows: list[TlaRow] = []
+    min_states = str(THRESHOLDS["min_tla_clean_states"])
+
+    for run_id, config, mode in [
+        ("clean-unprotected-enforced", TLA_UNPROTECTED_CFG, "enforced"),
+        ("clean-safe-as-configured", TLA_SAFE_CFG, "as-configured"),
+        ("clean-safe-enforced", TLA_SAFE_CFG, "enforced"),
+    ]:
+        rows.append(
+            _tla_check(
+                run_id=run_id,
+                kind="clean",
+                config=config,
+                mode=mode,
+                mutation_id="",
+                target_invariant="",
+                expected="clean",
+                arguments=["--mode", mode, "--min-states", min_states],
+            )
+        )
+
+    rows.append(
+        _tla_check(
+            run_id="unprotected-as-configured",
+            kind="unprotected",
+            config=TLA_UNPROTECTED_CFG,
+            mode="as-configured",
+            mutation_id="",
+            target_invariant="",
+            expected="violations",
+            arguments=["--mode", "as-configured", "--expect", "violations"],
+        )
+    )
+
+    for mutation_id, target_invariant in TLA_MUTATIONS:
+        rows.append(
+            _tla_check(
+                run_id=f"mutation-{mutation_id}",
+                kind="mutation",
+                config=TLA_SAFE_CFG,
+                mode=f"mutated:{mutation_id}",
+                mutation_id=mutation_id,
+                target_invariant=target_invariant,
+                expected="violations",
+                arguments=["--mutation", mutation_id],
+            )
+        )
+
+    # The negative parser gate: an invariant named in the `.cfg` that the
+    # module does not define. The checker must refuse the configuration.
+    corrupted = (REPO_ROOT / "target" / "tla-corrupted.cfg")
+    corrupted.parent.mkdir(parents=True, exist_ok=True)
+    original = TLA_UNPROTECTED_CFG.read_text(encoding="utf-8")
+    # The INVARIANTS entry, matched as a whole line: the name also appears
+    # inside a comment higher up, and corrupting that one would prove nothing.
+    needle = "\n    ContextIsolationInvariant\n"
+    assert original.count(needle) == 1, "the corrupted-cfg needle must stay unique"
+    corrupted.write_text(
+        original.replace(needle, "\n    ContextIsolationInvariantTypo\n"),
+        encoding="utf-8",
+    )
+    rows.append(
+        _tla_check(
+            run_id="corrupted-config-refused",
+            kind="corrupted_config",
+            config=corrupted,
+            mode="enforced",
+            mutation_id="",
+            target_invariant="",
+            expected="refused",
+            arguments=[],
+            stderr_needle="ContextIsolationInvariantTypo",
+        )
+    )
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# eBPF three-way equivalence
+# ---------------------------------------------------------------------------
+def _parse_cargo_test_output(text: str) -> dict:
+    """Per-target pass counts from `cargo test` output.
+
+    The gate is judged on the driver's exit code; these counts are the table's
+    evidence of what ran, not a substitute for it.
+    """
+    targets: dict[str, dict[str, int]] = {}
+    current = "unknown"
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("Doc-tests"):
+            current = "doc-tests"
+            continue
+        running = re.match(r"Running (?:unittests )?(\S+)", line)
+        if running:
+            current = running.group(1)
+            continue
+        result = re.match(r"test result: \w+\. (\d+) passed; (\d+) failed;", line)
+        if result:
+            bucket = targets.setdefault(current, {"passed": 0, "failed": 0})
+            bucket["passed"] += int(result.group(1))
+            bucket["failed"] += int(result.group(2))
+    passed = sum(bucket["passed"] for bucket in targets.values())
+    failed = sum(bucket["failed"] for bucket in targets.values())
+    return {
+        "targets": targets,
+        "passed": passed,
+        "failed": failed,
+        "equivalence_gates_passed": targets.get("tests\\shim_equivalence.rs", {}).get(
+            "passed", 0
+        ),
+    }
+
+
+def _parse_shim_report(text: str) -> dict:
+    """Parses the report grammar documented at the top of
+    `ebpf-probes/aegis_userspace_shim.c`.
+
+    An unrecognised line is an error: a parser that skips what it does not
+    understand can watch the report change shape and still call the run clean,
+    which is the failure mode this whole repository argues against.
+    """
+    counts = {
+        "policy": 0,
+        "lpm": 0,
+        "net": 0,
+        "exec": 0,
+        "cases": 0,
+        "events": 0,
+        "allows": 0,
+        "denies": 0,
+        "mismatches": 0,
+    }
+    banner = False
+    selftest_ok: bool | None = None
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line:
+            continue
+        if line == "SHIM aegis-ebpf-userspace 1":
+            banner = True
+        elif line.startswith("MAP policy "):
+            counts["policy"] += 1
+        elif line.startswith("MAP lpm "):
+            counts["lpm"] += 1
+        elif line.startswith("MAP net "):
+            counts["net"] += 1
+        elif line.startswith("MAP exec "):
+            counts["exec"] += 1
+        elif line.startswith("CASE "):
+            counts["cases"] += 1
+            if "-> allow" in line:
+                counts["allows"] += 1
+            elif "-> deny" in line:
+                counts["denies"] += 1
+            else:
+                raise ValueError(f"CASE line without a verdict: {line}")
+        elif line.startswith("EVENT "):
+            counts["events"] += 1
+        elif line.startswith("MISMATCH "):
+            counts["mismatches"] += 1
+        elif line == "SELFTEST ok":
+            selftest_ok = True
+        elif line.startswith("SELFTEST failed "):
+            selftest_ok = False
+        else:
+            raise ValueError(f"unrecognised shim report line: {line}")
+    if not banner:
+        raise ValueError("the shim report must open with the SHIM banner")
+    if selftest_ok is None:
+        raise ValueError("the shim report must close with a SELFTEST line")
+    counts["selftest_ok"] = selftest_ok
+    return counts
+
+
+def run_ebpf_suite() -> tuple[list[EbpfRow], dict]:
+    """Runs the real equivalence gate, then executes every build it leaves.
+
+    The gate is `cargo test --package aegis-ebpf-loader`: it compiles the
+    freestanding hooks from `ebpf-probes/` with the in-repo LLVM, replays all
+    24 cases through the C hooks, the Rust simulator and the RFC 9669 VM, then
+    rebuilds the harness five times with one fail-open mutation each and
+    requires its self-check to catch every one. This suite then runs each
+    resulting `aegis-shim.exe` itself and parses its report, so the per-case
+    verdicts and mutation diagnostics in the tables are read from the executed
+    artifacts, not from the gate's pass line.
+    """
+    if sys.platform != "win32":
+        raise RuntimeError(
+            "the eBPF three-way gate builds a native Windows shim "
+            "(aarch64-pc-windows-msvc); run the ebpf suite on the supported host"
+        )
+    wrapper = REPO_ROOT / ".toolchain" / "cargo.ps1"
+    if not wrapper.exists():
+        raise FileNotFoundError(f"missing cargo wrapper at {wrapper}")
+
+    completed = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(wrapper),
+            "test",
+            "--package",
+            "aegis-ebpf-loader",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=3600,
+    )
+    gate = _parse_cargo_test_output(completed.stdout)
+    gate["exit_code"] = completed.returncode
+    gate["all_gates_passed"] = (
+        completed.returncode == EXIT_OK
+        and gate["failed"] == 0
+        and gate["equivalence_gates_passed"] == 1 + len(EBPF_MUTATION_BUILDS)
+    )
+
+    rows: list[EbpfRow] = []
+    variants = [("clean", "equivalence")] + [
+        (name, "mutation") for name in EBPF_MUTATION_BUILDS
+    ]
+    executable_name = "aegis-shim.exe" if sys.platform == "win32" else "aegis-shim"
+    for variant, kind in variants:
+        executable = EBPF_SHIM_DIR / variant / executable_name
+        if not executable.exists():
+            raise FileNotFoundError(
+                f"{executable} is missing: the equivalence gate did not leave "
+                f"the {variant} build behind"
+            )
+        started = time.perf_counter()
+        executed = subprocess.run(
+            [str(executable)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=300,
+        )
+        duration_ms = (time.perf_counter() - started) * 1000.0
+        counts = _parse_shim_report(executed.stdout)
+        if kind == "equivalence":
+            passed = (
+                executed.returncode == EXIT_OK
+                and counts["selftest_ok"]
+                and counts["mismatches"] == 0
+                and counts["cases"] == EBPF_CASES
+                and counts["events"] == counts["cases"]
+            )
+        else:
+            passed = (
+                executed.returncode == EXIT_VIOLATIONS
+                and not counts["selftest_ok"]
+                and counts["mismatches"] >= 1
+            )
+        rows.append(
+            EbpfRow(
+                variant=variant,
+                kind=kind,
+                exit_code=executed.returncode,
+                map_policy=counts["policy"],
+                map_lpm=counts["lpm"],
+                map_net=counts["net"],
+                map_exec=counts["exec"],
+                cases=counts["cases"],
+                events=counts["events"],
+                allows=counts["allows"],
+                denies=counts["denies"],
+                mismatches=counts["mismatches"],
+                selftest_ok=counts["selftest_ok"],
+                executable_bytes=executable.stat().st_size,
+                duration_ms=round(duration_ms, 4),
+                passed=passed,
+            )
+        )
+    return rows, gate
+
+
+# ---------------------------------------------------------------------------
 # Aggregation
 # ---------------------------------------------------------------------------
 def summarise(
@@ -484,10 +972,15 @@ def summarise(
     divergence_rows: Sequence[DivergenceRow],
     rag_rows: Sequence[RagRow],
     latency_rows: Sequence[LatencyRow],
+    tla_rows: Sequence[TlaRow],
+    ebpf_rows: Sequence[EbpfRow],
+    ebpf_gate: dict,
     started: float,
 ) -> dict:
     vulnerable = [r for r in static_rows if r.expected_malicious]
     benign = [r for r in static_rows if not r.expected_malicious]
+    clean_tla = [r for r in tla_rows if r.kind == "clean"]
+    clean_ebpf = next((r for r in ebpf_rows if r.kind == "equivalence"), None)
 
     recall = sum(1 for r in vulnerable if r.detected)
     false_positives = sum(1 for r in benign if r.detected)
@@ -522,14 +1015,22 @@ def summarise(
             "recall_percent": round(100.0 * recall / max(1, len(vulnerable)), 2),
             "false_positive_count": false_positives,
             "false_positive_percent": round(100.0 * false_positives / max(1, len(benign)), 2),
-            "min_compression_ratio": round(min(r.compression_ratio for r in static_rows), 6),
+            "min_compression_ratio": round(
+                min((r.compression_ratio for r in static_rows), default=0.0), 6
+            ),
             "mean_compression_ratio": round(
                 statistics.mean(r.compression_ratio for r in static_rows), 6
+            )
+            if static_rows
+            else 0.0,
+            "max_compression_ratio": round(
+                max((r.compression_ratio for r in static_rows), default=0.0), 6
             ),
-            "max_compression_ratio": round(max(r.compression_ratio for r in static_rows), 6),
             "total_raw_nodes": sum(r.raw_cpg_node_count for r in static_rows),
             "total_compressed_nodes": sum(r.compressed_node_count for r in static_rows),
-            "median_scan_ms": round(statistics.median(r.scan_ms for r in static_rows), 4),
+            "median_scan_ms": round(statistics.median(r.scan_ms for r in static_rows), 4)
+            if static_rows
+            else 0.0,
         },
         "chains": {
             "total": len(chain_rows),
@@ -576,6 +1077,53 @@ def summarise(
             if rag_rows
             else 0.0,
             "queries_improved": sum(1 for r in rag_rows if r.improved),
+        },
+        "tla": {
+            "runs": len(tla_rows),
+            "clean_runs": len(clean_tla),
+            "clean_runs_clean": sum(
+                1 for r in clean_tla if r.observed_outcome == "clean"
+            ),
+            "min_clean_states": min(
+                (r.distinct_states for r in clean_tla), default=0
+            ),
+            "max_clean_states": max(
+                (r.distinct_states for r in clean_tla), default=0
+            ),
+            "unprotected_as_configured_violations": next(
+                (r.violations for r in tla_rows if r.kind == "unprotected"), 0
+            ),
+            "mutations_attempted": sum(1 for r in tla_rows if r.kind == "mutation"),
+            "mutations_caught": sum(
+                1 for r in tla_rows if r.kind == "mutation" and r.passed
+            ),
+            "corrupted_config_refused": any(
+                r.kind == "corrupted_config"
+                and r.observed_outcome == "refused"
+                and r.exit_code != EXIT_OK
+                for r in tla_rows
+            ),
+            "total_check_ms": round(sum(r.duration_ms for r in tla_rows), 4),
+        },
+        "ebpf": {
+            "gate_passed": bool(ebpf_gate.get("all_gates_passed")),
+            "tests_passed": int(ebpf_gate.get("passed", 0)),
+            "tests_failed": int(ebpf_gate.get("failed", 0)),
+            "equivalence_gates_passed": int(
+                ebpf_gate.get("equivalence_gates_passed", 0)
+            ),
+            "cases_per_verdict_sweep": EBPF_CASES,
+            "implementations_compared": 3,
+            "clean_cases": clean_ebpf.cases if clean_ebpf else 0,
+            "clean_allows": clean_ebpf.allows if clean_ebpf else 0,
+            "clean_denies": clean_ebpf.denies if clean_ebpf else 0,
+            "clean_mismatches": clean_ebpf.mismatches if clean_ebpf else 0,
+            "mutations_attempted": sum(1 for r in ebpf_rows if r.kind == "mutation"),
+            "mutations_caught": sum(
+                1 for r in ebpf_rows if r.kind == "mutation" and r.passed
+            ),
+            "total_mismatch_lines": sum(r.mismatches for r in ebpf_rows),
+            "clean_executable_bytes": clean_ebpf.executable_bytes if clean_ebpf else 0,
         },
         "latency_ms": {row.stage: row.minimum for row in latency_rows},
         "latency_median_ms": {row.stage: row.median for row in latency_rows},
@@ -634,6 +1182,40 @@ def check_thresholds(summary: dict) -> list[str]:
             f"end-to-end scoring {summary['end_to_end_scoring_ms']:.3f} ms > "
             f"{THRESHOLDS['max_end_to_end_scoring_ms']} ms"
         )
+    tla = summary["tla"]
+    if tla["clean_runs"] and tla["clean_runs_clean"] != tla["clean_runs"]:
+        failures.append(
+            f"TLA+ clean gates: {tla['clean_runs_clean']}/{tla['clean_runs']} were clean"
+        )
+    if tla["min_clean_states"] < THRESHOLDS["min_tla_clean_states"]:
+        failures.append(
+            f"TLA+ smallest clean run explored {tla['min_clean_states']} states < "
+            f"{THRESHOLDS['min_tla_clean_states']}"
+        )
+    if tla["mutations_attempted"] and tla["mutations_caught"] != tla["mutations_attempted"]:
+        failures.append(
+            f"TLA+ caught {tla['mutations_caught']}/{tla['mutations_attempted']} mutations"
+        )
+    if not tla["corrupted_config_refused"]:
+        failures.append("the corrupted TLA+ configuration was not refused")
+    if tla["unprotected_as_configured_violations"] < 1:
+        failures.append(
+            "the unprotected TLA+ configuration produced no violation witness"
+        )
+    ebpf = summary["ebpf"]
+    if not ebpf["gate_passed"]:
+        failures.append(
+            f"the eBPF equivalence gate failed "
+            f"({ebpf['tests_failed']} test failures, exit != 0)"
+        )
+    if ebpf["mutations_attempted"] and ebpf["mutations_caught"] != ebpf["mutations_attempted"]:
+        failures.append(
+            f"eBPF caught {ebpf['mutations_caught']}/{ebpf['mutations_attempted']} mutations"
+        )
+    if ebpf["clean_mismatches"] != 0:
+        failures.append(
+            f"the clean eBPF sweep reported {ebpf['clean_mismatches']} mismatches"
+        )
     return failures
 
 
@@ -664,9 +1246,14 @@ def _duckdb_type(annotation: str) -> str:
 
 
 def write_duckdb(
-    static_rows, chain_rows, divergence_rows, rag_rows, latency_rows
+    static_rows, chain_rows, divergence_rows, rag_rows, latency_rows, tla_rows, ebpf_rows
 ) -> dict[str, str]:
-    """Write every table to DuckDB, then export a union to Parquet."""
+    """Write every table to DuckDB, then export the Parquet copies.
+
+    The union file keeps the Stage-1/divergence shape it always had; the TLA+
+    and eBPF tables carry different schemas, so each gets its own file rather
+    than being padded into a union nothing would query.
+    """
     import duckdb
 
     database = RESULTS_DIR / "aegis_benchmarks.duckdb"
@@ -694,6 +1281,16 @@ def write_duckdb(
     load("divergence_scores", divergence_rows, DivergenceRow)
     load("rag_ablation", rag_rows, RagRow)
     load("latency", latency_rows, LatencyRow)
+    load("tla_model_checks", tla_rows, TlaRow)
+    load("ebpf_equivalence", ebpf_rows, EbpfRow)
+
+    def export(table: str, parquet: Path) -> None:
+        if parquet.exists():
+            parquet.unlink()
+        connection.execute(
+            f"COPY (SELECT * FROM {table}) "
+            f"TO '{parquet.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)"
+        )
 
     parquet = RESULTS_DIR / "aegis_benchmarks.parquet"
     if parquet.exists():
@@ -703,16 +1300,26 @@ def write_duckdb(
         "UNION ALL BY NAME SELECT * FROM divergence_scores) "
         f"TO '{parquet.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)"
     )
+    tla_parquet = RESULTS_DIR / "aegis_tla_checks.parquet"
+    export("tla_model_checks", tla_parquet)
+    ebpf_parquet = RESULTS_DIR / "aegis_ebpf_equivalence.parquet"
+    export("ebpf_equivalence", ebpf_parquet)
     connection.close()
     return {
         "duckdb": str(database.relative_to(REPO_ROOT)),
         "parquet": str(parquet.relative_to(REPO_ROOT)),
+        "tla_parquet": str(tla_parquet.relative_to(REPO_ROOT)),
+        "ebpf_parquet": str(ebpf_parquet.relative_to(REPO_ROOT)),
     }
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--suite", default="all", help="all | static | chains | rag | divergence | latency")
+    parser.add_argument(
+        "--suite",
+        default="all",
+        help="all | static | chains | rag | divergence | latency | tla | ebpf",
+    )
     parser.add_argument(
         "--no-persist",
         action="store_true",
@@ -722,7 +1329,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     started = time.time()
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    suites = {"static", "chains", "rag", "divergence", "latency"}
+    suites = {"static", "chains", "rag", "divergence", "latency", "tla", "ebpf"}
     chosen = suites if args.suite == "all" else {args.suite}
 
     print(f"aegis-cli     : {CLI}", flush=True)
@@ -785,8 +1392,46 @@ def main(argv: Sequence[str] | None = None) -> int:
                 flush=True,
             )
 
+    tla_rows: list[TlaRow] = []
+    if "tla" in chosen:
+        print("\n== TLA+ model checking ==", flush=True)
+        tla_rows = run_tla_suite()
+        for row in tla_rows:
+            print(
+                f"  {row.run_id:<40} {row.observed_outcome:<10} "
+                f"states={row.distinct_states:<5} {row.duration_ms:8.2f} ms",
+                flush=True,
+            )
+
+    ebpf_rows: list[EbpfRow] = []
+    ebpf_gate: dict = {}
+    if "ebpf" in chosen:
+        print("\n== eBPF three-way equivalence ==", flush=True)
+        ebpf_rows, ebpf_gate = run_ebpf_suite()
+        print(
+            f"  cargo gate: {ebpf_gate['passed']} tests passed, "
+            f"{ebpf_gate['failed']} failed "
+            f"({ebpf_gate['equivalence_gates_passed']} equivalence gates)",
+            flush=True,
+        )
+        for row in ebpf_rows:
+            print(
+                f"  {row.variant:<28} exit={row.exit_code} cases={row.cases} "
+                f"mismatches={row.mismatches} "
+                f"selftest={'ok' if row.selftest_ok else 'failed'}",
+                flush=True,
+            )
+
     summary = summarise(
-        static_rows, chain_rows, divergence_rows, rag_rows, latency_rows, started
+        static_rows,
+        chain_rows,
+        divergence_rows,
+        rag_rows,
+        latency_rows,
+        tla_rows,
+        ebpf_rows,
+        ebpf_gate,
+        started,
     )
     summary["thresholds"] = THRESHOLDS
     failures = check_thresholds(summary) if chosen == suites else []
@@ -803,10 +1448,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     (RESULTS_DIR / "summary_metrics.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8"
     )
-    paths = write_duckdb(static_rows, chain_rows, divergence_rows, rag_rows, latency_rows)
+    paths = write_duckdb(
+        static_rows,
+        chain_rows,
+        divergence_rows,
+        rag_rows,
+        latency_rows,
+        tla_rows,
+        ebpf_rows,
+    )
     print(f"\nwritten benchmarks/results/summary_metrics.json", flush=True)
     print(f"written {paths['duckdb']}", flush=True)
     print(f"written {paths['parquet']}", flush=True)
+    print(f"written {paths['tla_parquet']}", flush=True)
+    print(f"written {paths['ebpf_parquet']}", flush=True)
 
     if failures:
         print("\nTHRESHOLD FAILURES:", flush=True)

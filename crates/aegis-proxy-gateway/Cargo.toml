@@ -29,7 +29,17 @@ aegis-common.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 axum = "0.7"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "io-util"] }
 sha2.workspace = true
 base64.workspace = true
 hex.workspace = true
+rand_core.workspace = true
+# The SSE endpoint implements `Stream` by hand for the telemetry broadcast
+# receiver; `futures-core` is the trait's home and the only piece of it needed.
+futures-core = "0.3"
+
+[dev-dependencies]
+# The live integration tests build their Data Transformation Graphs with the
+# real Stage 1 extractor rather than hand-written literals, so a Cypher query is
+# always executed against the same graph shape the pipeline emits.
+aegis-dtg-parser.workspace = true
