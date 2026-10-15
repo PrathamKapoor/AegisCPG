@@ -94,6 +94,8 @@ mod integration_tests {
                 hop_depth: 1,
             
                 expression: String::new(),}],
+            dependencies: vec!["net".into()],
+            injection_markers: vec![],
             dtg_sha256: String::new(),
         }
     }

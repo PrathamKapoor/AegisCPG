@@ -227,6 +227,26 @@ fn dtg_hash_subject(dtg: &CompressedDtg) -> Value {
         key(a).cmp(&key(b))
     });
 
+    let mut dependencies: Vec<Value> = dtg
+        .dependencies
+        .iter()
+        .map(|d| Value::String(d.clone()))
+        .collect();
+    // Sorted so that two extractions which visited the files in a different
+    // order hash identically, matching invariant I1 for nodes and edges.
+    dependencies.sort_by(|a, b| {
+        a.as_str().unwrap_or_default().cmp(b.as_str().unwrap_or_default())
+    });
+
+    let mut markers: Vec<Value> = dtg
+        .injection_markers
+        .iter()
+        .map(|m| Value::String(m.clone()))
+        .collect();
+    markers.sort_by(|a, b| {
+        a.as_str().unwrap_or_default().cmp(b.as_str().unwrap_or_default())
+    });
+
     serde_json::json!({
         "aegis_dtg_canonical_v1": true,
         "server_id": dtg.server_id,
@@ -234,6 +254,8 @@ fn dtg_hash_subject(dtg: &CompressedDtg) -> Value {
         "nodes": nodes,
         "edges": edges,
         "detected_sinks": sinks,
+        "dependencies": dependencies,
+        "injection_markers": markers,
     })
 }
 
@@ -451,8 +473,39 @@ mod tests {
                 hop_depth: 2,
             
                 expression: String::new(),}],
+            dependencies: vec!["os".into(), "subprocess".into()],
+            injection_markers: vec![],
             dtg_sha256: String::new(),
         }
+    }
+
+    #[test]
+    fn dependency_substitution_changes_the_hash() {
+        // The supply-chain rug pull: identical control flow, identical sinks,
+        // one dependency swapped. Without the dependency list in the hash
+        // subject this pair hashes identically and the substitution is
+        // invisible to Stage 3.
+        let base = fixture();
+        let hash = canonical_dtg_hash(&base).unwrap();
+
+        let mut swapped = base.clone();
+        swapped.dependencies = vec!["slak-mcp-server".into()];
+        assert_ne!(
+            canonical_dtg_hash(&swapped).unwrap(),
+            hash,
+            "a typosquatted dependency must change the DTG hash"
+        );
+
+        // Permuting the dependency list must NOT change it, matching invariant
+        // I1 for nodes and edges.
+        let mut reordered = base.clone();
+        reordered.dependencies = vec!["subprocess".into(), "os".into()];
+        assert_eq!(canonical_dtg_hash(&reordered).unwrap(), hash);
+
+        // And the honest package must not be confused with the typosquat.
+        let mut honest = base.clone();
+        honest.dependencies = vec!["slack-mcp-server".into()];
+        assert_ne!(canonical_dtg_hash(&honest).unwrap(), canonical_dtg_hash(&swapped).unwrap());
     }
 
     #[test]

@@ -359,6 +359,8 @@ mod tests {
             nodes: vec![],
             edges: vec![],
             detected_sinks: vec![],
+            dependencies: vec!["os".into()],
+            injection_markers: vec![],
             dtg_sha256: "a".repeat(64),
         }
     }

@@ -156,6 +156,8 @@ mod tests {
                 hop_depth: 1,
                 expression: String::new(), // inserted by tooling
             }],
+            dependencies: vec!["os".to_string()],
+            injection_markers: vec![],
             dtg_sha256: String::new(),
         };
         d.dtg_sha256 = canonical_dtg_hash(&d).unwrap();

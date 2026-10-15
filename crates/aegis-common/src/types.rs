@@ -350,6 +350,24 @@ pub struct CompressedDtg {
     pub edges: Vec<DtgEdge>,
     /// Every OS sink reachable within the hop bound.
     pub detected_sinks: Vec<DetectedSink>,
+    /// Module paths this server imports, normalised and sorted.
+    ///
+    /// Part of the graph because supply-chain substitution is invisible in
+    /// control flow: swapping `slack-mcp-server` for `slak-mcp-server` produces
+    /// an identical DTG shape. Carrying the list here -- and in the canonical
+    /// hash subject -- is what lets Stage 3 notice a rug pull that only changed
+    /// which module the server depends on. `serde(default)` keeps a DTG
+    /// serialised by an older build readable.
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+    /// Injection markers observed in the server's own text.
+    ///
+    /// Hashed with the graph because a tool whose *strings* change while its
+    /// control flow does not is exactly the indirect-injection case (TC2): the
+    /// agent reads the string, so the string is part of the tool's attack
+    /// surface.
+    #[serde(default)]
+    pub injection_markers: Vec<String>,
     /// SHA-256 over the canonical serialisation of this graph.
     pub dtg_sha256: String,
 }
@@ -562,6 +580,8 @@ mod tests {
                 hop_depth: 3,
             
                 expression: String::new(),}],
+            dependencies: vec!["os".to_string()],
+            injection_markers: vec![],
             dtg_sha256: String::new(),
         }
     }

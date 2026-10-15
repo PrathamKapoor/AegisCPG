@@ -262,6 +262,9 @@ pub fn compress_with_language(
 
     let raw_cpg_node_count: usize = reports.iter().map(|r| r.raw_cpg_node_count).sum();
 
+    let dependencies: Vec<String> = unit.imports.iter().cloned().collect();
+    let injection_markers: Vec<String> = unit.injection_markers.iter().cloned().collect();
+
     let mut dtg = CompressedDtg {
         server_id: server_id.to_string(),
         language: language.map(|l| l.as_str()).unwrap_or("unknown").to_string(),
@@ -270,6 +273,8 @@ pub fn compress_with_language(
         nodes,
         edges,
         detected_sinks: detected,
+        dependencies,
+        injection_markers,
         dtg_sha256: String::new(),
     };
 
