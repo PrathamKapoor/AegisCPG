@@ -1,0 +1,36 @@
+{
+  "author": "Pratham Kapoor <prathamkapoor027@gmail.com>",
+  "name": "aegis-web-portal",
+  "version": "1.0.0",
+  "description": "AegisCPG Next.js security command center: interactive 3D DTG canvas, SMT counterexample viewer, eBPF telemetry table, and the FIDO2 step-up modal.",
+  "repository": "https://github.com/PrathamKapoor/AegisCPG",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "test": "node --test \"tests/*.test.mjs\""
+  },
+  "dependencies": {
+    "@deck.gl/core": "9.x",
+    "@deck.gl/layers": "9.x",
+    "@deck.gl/react": "9.x",
+    "@tanstack/react-table": "8.x",
+    "deck.gl": "9.x",
+    "lucide-react": "0.400.x",
+    "next": "15.x",
+    "react": "19.x",
+    "react-dom": "19.x",
+    "recharts": "2.x"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.x",
+    "@types/node": "22.x",
+    "@types/react": "19.x",
+    "@types/react-dom": "19.x",
+    "autoprefixer": "10.x",
+    "postcss": "9.x",
+    "tailwindcss": "4.x",
+    "typescript": "5.x"
+  }
+}

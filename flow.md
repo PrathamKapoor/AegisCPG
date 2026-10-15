@@ -681,3 +681,73 @@ Gateway        Temporal        Postgres/Timescale   Tauri tray   Flutter phone
 | Lattice composition check | < 0.05 ms | 4-element chain, integer compare |
 | Kernel LSM deny | 0.04 ms | synchronous LSM hook |
 | End-to-end proxy overhead | < 4.5 ms | no GC, no allocator churn on hot path |
+---
+
+## Appendix C — Post-Mortem: Six Real Bugs Caught by the Test Suite
+
+**Author:** Pratham Kapoor `<prathamkapoor027@gmail.com>`
+
+Every item below was found by a failing test or a failing benchmark assertion,
+never by reading the code. They are recorded here, and in full in `decisions.md`,
+because an implementation that hides its own near-misses cannot be audited.
+
+### C.1 Lexer recorded token *end* positions (silent)
+
+The lexer snapshotted `line`/`col` after consuming each token. A docstring opened
+at column 5 was recorded at column 42. Python block extent is decided by
+comparing that column against the `def` line, so the comparison was meaningless
+and every function body ran to end-of-file. The interprocedural call graph came
+out empty and every call was attributed to module scope -- exactly the blindness
+Stage 1 exists to remove. **Impact: silent.** The scan reported a clean file that
+contained an active exploit.
+
+### C.2 DTG hash omitted sink arguments (TV5 bypass)
+
+`subprocess.run(["wc"])` and `subprocess.run(["curl", "-d", "@.env"])` produced
+an **identical** DTG SHA-256, because the structural hash covered sink identities
+but not sink arguments. A rug pull that only rewrites the argument list left the
+attested hash intact, so the signature still verified and the kernel policy still
+loaded. `DetectedSink.expression` now carries the normalised call text and is
+part of the hash subject.
+
+### C.3 Over-broad `.decode()` pattern became a self-inflicted outage
+
+Adding `decode` as an obfuscation sink flagged every `subprocess.run(...).stdout.decode()`
+as `UnboundedDynamic`. Under ADR-005 that removes **every** exec and network
+grant, so a benign server was reduced to zero capability. Fail-closed rules
+amplify precision errors into availability incidents: **a too-broad rule is a
+wrong rule, not a conservative one.** Replaced with the real primitives
+(`b64decode`, `codecs.decode`, `atob`, `fromCharCode`).
+
+### C.4 Ringbuffer decoder missing an 8-byte field (forensic corruption)
+
+The C `aegis_kernel_event` grew a `latency_ns` field; the Rust decoder's offsets
+were not updated, so `comm` and `target` were read eight bytes early
+(`EVENT_SIZE_BYTES` 176 vs 184). A `DENY_EXECVE` on `/bin/sh` would have been
+attributed to the wrong process and path. Caught by `bpf_layout.rs`, which parses
+the BPF C and asserts the field order, bit positions and hook codes against the
+Rust constants -- the contract is verifiable on Windows even though compiling the
+object is not.
+
+### C.5 Case-folded haystack vs. uppercase injection marker
+
+The sanitiser lowercased the JSON-RPC payload and then tested it against patterns
+like `<IMPORTANT>`, which never match. The most common injection marker in the
+literature was the one the filter was blind to. The needle is now case-folded
+too, while the audit log still reports the original rule that fired.
+
+### C.6 The verifier rejected a fixture I had written myself
+
+The lattice solver flagged a workflow in which a `CONFIDENTIAL`-cleared
+filesystem server read a `SECRET` `.env`. The solver was right: such a server is
+itself violating Property 2. The fixture encoded my assumption rather than the
+requirement. Corrected, and the property is now asserted in its own test so the
+intent is explicit.
+
+### C.7 What the pattern means
+
+Four of the six are *silent*: no error, no warning, a confident wrong answer. The
+only thing that caught them was a test that asserted a property the code did not
+have to satisfy for the happy path. That is the argument for writing the
+conformance test **before** the component, and for treating "the test was wrong"
+as a finding rather than an obstruction.

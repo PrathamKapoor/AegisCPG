@@ -3,7 +3,7 @@
 # Author: Pratham Kapoor <prathamkapoor027@gmail.com>
 # https://github.com/PrathamKapoor
 #
-# WHAT:   Root Cargo workspace for the six AegisCPG crates.
+# WHAT:   Root Cargo workspace for the AegisCPG crates.
 # WHY:    One workspace, one lockfile, one `cargo test --workspace` gate. A
 #         verifier whose crates can be built independently can also be
 #         version-skewed independently, and a hash pinned by one crate is
@@ -21,10 +21,16 @@ members = [
     "crates/aegis-ebpf-loader",
     "crates/aegis-proxy-gateway",
     "crates/aegis-cli",
+    "crates/aegis-desktop-core",
 ]
 
-# The portable toolchain bootstrap must never be mistaken for a workspace member.
-exclude = [".toolchain", "target"]
+# The portable toolchain bootstrap and the Tauri shell are never workspace
+# members. `apps/desktop-firewall` depends on the `tauri` crate, which is not
+# vendored and cannot be fetched on this air-gapped host; listing it here would
+# make `cargo test --workspace` fail for every contributor for the sake of one
+# optional binary. Its logic lives in `crates/aegis-desktop-core`, which is a
+# member and is tested.
+exclude = [".toolchain", "target", "apps"]
 
 [workspace.package]
 version = "1.0.0"

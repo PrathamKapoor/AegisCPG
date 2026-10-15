@@ -1,0 +1,28 @@
+[package]
+name = "aegis-desktop-core"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+description = "AegisCPG desktop firewall: discovery and idempotent wrapping of local stdio MCP server configurations."
+authors = ["Pratham Kapoor <prathamkapoor027@gmail.com>"]
+repository = "https://github.com/PrathamKapoor/AegisCPG"
+keywords = ["security", "mcp", "ebpf", "desktop", "firewall"]
+categories = ["gui", "security"]
+
+[lib]
+name = "aegis_desktop_core"
+path = "src/lib.rs"
+
+[dependencies]
+# Only the two crates the workspace already vendors. The Tauri runtime lives in
+# the sibling `apps/desktop-firewall` shell, which is excluded from the
+# workspace because it cannot be fetched on this air-gapped host. Keeping the
+# logic here means it compiles and is tested; keeping it in the shell would mean
+# neither.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+
+[dev-dependencies]
+# No temp-dir crate: the tests write into the workspace's own .mlcache so every
+# byte stays inside the repository (Hard Rule 1).

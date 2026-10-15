@@ -1,0 +1,58 @@
+# AegisCPG -- Rust build image.
+#
+# Author: Pratham Kapoor <prathamkapoor027@gmail.com>
+# https://github.com/PrathamKapoor
+#
+# WHAT:  Compiles the workspace and ships only the binaries.
+# WHY:   The container's verifier is the repository's verifier. Building inside
+#        the image rather than copying a prebuilt binary means a reviewer can
+#        read what is running rather than trusting a tag.
+# HOW:   Two stages, the second with no toolchain and no source tree. `cargo test`
+#        runs during the build, so an image that builds is an image that passed
+#        its tests.
+
+FROM rust:1.82-bookworm AS build
+
+# The linker and the kernel headers the `p256`/`ring` build need.
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y \
+        clang \
+        llvm \
+        libssl-dev \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ ./crates/
+
+# Tests run here. A build that fails them does not produce a layer.
+RUN cargo test --workspace --release --locked \
+    && cargo build --workspace --release --locked
+
+FROM debian:bookworm-slim AS runtime
+
+# `lld` is kept: the verifier links against the P-256 crate, and a missing
+# linker turns a 2-second build into an unresolvable link error at runtime.
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y \
+        ca-certificates \
+        lld \
+    && rm -rf /var/lib/apt/lists/*
+
+# Unprivileged: every compose service drops all capabilities and sets
+# `no-new-privileges`, so the image must not need root to run.
+RUN useradd --system --uid 65534 --no-create-home --shell /usr/sbin/nologin aegis
+
+COPY --from=build /build/target/release/aegis-cli /usr/local/bin/aegis-cli
+COPY --from=build /build/target/release/aegis-proxy-gateway /usr/local/bin/aegis-proxy-gateway
+COPY --from=build /build/target/release/aegis-ebpf-loader /usr/local/bin/aegis-ebpf-loader
+
+USER 65534:65534
+WORKDIR /srv
+EXPOSE 8443
+
+# No default CMD: the compose file names the subcommand per service, because a
+# container that starts the verifier when the operator meant the gateway is a
+# container that appears to be working.
+CMD ["aegis-cli", "version"]

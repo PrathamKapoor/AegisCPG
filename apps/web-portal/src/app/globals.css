@@ -1,0 +1,72 @@
+/*
+ * AegisCPG web portal -- global styles.
+ * Author: Pratham Kapoor <prathamkapoor027@gmail.com>
+ * https://github.com/PrathamKapoor
+ *
+ * WHY NO TAILWIND IMPORT
+ *   The components use utility classes, which need Tailwind's generated sheet.
+ *   That sheet is produced by `npm run build`, which needs the registry. Until
+ *   then this file provides the same colours and spacing by hand so the page is
+ *   legible without a build step rather than rendering as unstyled text.
+ */
+
+:root {
+  color-scheme: dark;
+  --aegis-bg: #09090b;
+  --aegis-panel: #18181b;
+  --aegis-border: #27272a;
+  --aegis-text: #fafafa;
+  --aegis-muted: #a1a1aa;
+  --aegis-accent: #10b981;
+  --aegis-danger: #fb7185;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--aegis-bg);
+  color: var(--aegis-text);
+  font-family:
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    Roboto,
+    'Helvetica Neue',
+    Arial,
+    sans-serif;
+  line-height: 1.5;
+}
+
+code,
+pre {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.875em;
+}
+
+button {
+  cursor: pointer;
+  font: inherit;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+/* Scrollbars: visible on a dark canvas, where the default is invisible. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--aegis-bg);
+}
+
+::-webkit-scrollbar-thumb {
+  background: #3f3f46;
+  border-radius: 5px;
+}

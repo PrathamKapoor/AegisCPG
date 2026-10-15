@@ -1,0 +1,47 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Aegis Desktop Firewall",
+  "version": "1.0.0",
+  "author": "Pratham Kapoor <prathamkapoor027@gmail.com>",
+  "description": "AegisCPG native desktop stdio MCP server wrapper and firewall.",
+  "license": "Apache-2.0",
+  "repository": "https://github.com/PrathamKapoor/AegisCPG",
+  "identifier": "dev.pratham.aegis.desktop-firewall",
+  "build": {
+    "beforeDevCommand": "npm --prefix ../web-portal run dev",
+    "beforeBuildCommand": "npm --prefix ../web-portal run build",
+    "frontendDist": "../../web-portal/out",
+    "devUrl": "http://localhost:3000"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Aegis Desktop Firewall",
+        "width": 960,
+        "height": 680,
+        "resizable": true,
+        "decorations": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'",
+      "capabilities": ["default"]
+    },
+    "trayIcon": {
+      "id": "aegis-tray",
+      "iconPath": "icons/tray.png",
+      "tooltip": "AegisCPG - inline edit automaton gateway active",
+      "iconAsTemplate": true,
+      "menuOnLeftClick": false
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["msi", "deb", "appimage"],
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.png"],
+    "category": "DeveloperTool",
+    "shortDescription": "Wrap stdio MCP servers in the AegisCPG proxy",
+    "longDescription": "Discovers Claude Desktop, Cursor and VS Code MCP server configurations and rewrites their stdio commands so every tool call passes through AegisCPG's inline edit automaton, lattice verification and capability-restricted TACR."
+  }
+}

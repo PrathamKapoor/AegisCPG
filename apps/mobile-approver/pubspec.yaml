@@ -1,0 +1,38 @@
+name: aegis_mobile_approver
+version: 1.0.0
+description: >-
+  Hardware-backed biometric step-up approval for AegisCPG's temporal
+  declassification workflow. Shows the exact lattice transition being
+  authorised and signs an assertion bound to that datum hash.
+publish_to: none
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # WebAuthn / FIDO2 platform-channel bridge. Chosen over a bare `cryptography`
+  # binding because the private key never enters the Dart heap: the assertion is
+  # produced inside the platform authenticator.
+  flutter_web_auth_2: ^4.1.0
+  # ECDSA P-256 over P-256, used only to *verify* in test vectors -- never to
+  # hold a key.
+  p256: ^0.13.4
+  crypto: ^3.0.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+
+aegis:
+  notBuiltOnThisHost: >-
+    No Dart or Flutter SDK is installed on this air-gapped ARM64 host, so this
+    package cannot be compiled or tested here and its source is not covered by
+    any executed test. The approval *policy* it implements is the same policy
+    `workflows/` implements in Python and is tested there; what remains here is
+    the platform-channel plumbing and the widgets.
