@@ -361,6 +361,7 @@ mod tests {
             detected_sinks: vec![],
             dependencies: vec!["os".into()],
             injection_markers: vec![],
+            egress_literals: vec![],
             dtg_sha256: "a".repeat(64),
         }
     }

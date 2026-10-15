@@ -264,6 +264,7 @@ pub fn compress_with_language(
 
     let dependencies: Vec<String> = unit.imports.iter().cloned().collect();
     let injection_markers: Vec<String> = unit.injection_markers.iter().cloned().collect();
+    let egress_literals: Vec<String> = unit.egress_literals.iter().cloned().collect();
 
     let mut dtg = CompressedDtg {
         server_id: server_id.to_string(),
@@ -275,6 +276,7 @@ pub fn compress_with_language(
         detected_sinks: detected,
         dependencies,
         injection_markers,
+        egress_literals,
         dtg_sha256: String::new(),
     };
 

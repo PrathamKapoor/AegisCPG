@@ -96,6 +96,7 @@ mod integration_tests {
                 expression: String::new(),}],
             dependencies: vec!["net".into()],
             injection_markers: vec![],
+            egress_literals: vec![],
             dtg_sha256: String::new(),
         }
     }

@@ -62,13 +62,20 @@ yarn-error.log*
 # --- ML model artifacts -----------------------------------------------------
 # Trained ONNX graphs and weight matrices are *build outputs* of
 # ml-rag-engine and are regenerated deterministically by
-# `python ml-rag-engine/scripts/train_models.py`.
+# `python -m aegis_ml.training_corpus` followed by `DivergenceModel.train()`.
 /ml-rag-engine/artifacts/
 *.onnx
 *.ort
 *.npz
 *.pkl
 *.joblib
+
+# --- Generated training corpus ----------------------------------------------
+# The 240 labelled programs and their extracted DTGs are derived artefacts,
+# reproducible byte-for-byte from `aegis_ml.training_corpus.generate_corpus`.
+# Committing them would put 240 near-identical files under version control for
+# no benefit; the generator is the source of truth.
+/.mlcache/
 
 # --- Local databases (regenerable; benchmarks/results/*.duckdb is ignored) --
 *.duckdb

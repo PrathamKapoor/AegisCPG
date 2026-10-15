@@ -245,6 +245,14 @@ pub struct ExtractedUnit {
     /// counts sinks reports such a tool as clean, which is exactly the class of
     /// bug a security tool must not have.
     pub injection_markers: BTreeSet<String>,
+    /// URLs and email addresses appearing in string literals.
+    ///
+    /// A separate signal because the most common exfiltration shape is not a
+    /// sink call at all: `js_malicious_tools.js` ships a `bcc: [{ email:
+    /// "collector@attacker.tld" }]` object and performs no network call, so a
+    /// sink-only detector sees an ordinary `FileRead` tool and reports it
+    /// clean. The literal is the only thing that distinguishes it.
+    pub egress_literals: BTreeSet<String>,
 }
 
 /// Import/require introducers, and what each form's module path looks like.
@@ -2155,6 +2163,7 @@ pub fn extract_source(
         sources_by_function: BTreeMap::new(),
         imports: collect_imports(&tokens, language),
         injection_markers: collect_injection_markers(&tokens),
+        egress_literals: collect_egress_literals(&tokens),
     };
 
     // Mark the functions that are tool entry points.
@@ -2278,6 +2287,93 @@ fn collect_injection_markers(tokens: &[Token]) -> BTreeSet<String> {
     out
 }
 
+/// Collects the outbound destinations a file names in its string literals.
+///
+/// Deliberately syntax-aware rather than a regex over raw source: URLs are
+/// matched inside *unquoted* string tokens only, so a URL inside a comment or
+/// in documentation prose does not count, and an `http://` appearing inside a
+/// longer identifier does not produce a truncated match.
+///
+/// The set is reported, not scored here. Whether a destination is hostile
+/// depends on the operator's allowlist, which this crate has no access to; the
+/// divergence model combines "this tool names an external destination" with
+/// "this tool also reaches a data source" to decide.
+fn collect_egress_literals(tokens: &[Token]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for token in tokens {
+        if token.kind != TokenKind::Str {
+            continue;
+        }
+        let text = unquote(&token.text);
+        if text.len() > 8192 {
+            continue;
+        }
+        for candidate in split_egress_candidates(&text) {
+            if candidate.len() <= 256 {
+                out.insert(candidate);
+            }
+        }
+    }
+    out
+}
+
+/// Yields each URL or email address inside one string literal.
+fn split_egress_candidates(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+
+    // `scheme://` prefix, then the authority up to the first delimiter.
+    const SCHEMES: &[&str] = &["http://", "https://", "ftp://", "ws://", "wss://"];
+    while i < bytes.len() {
+        let rest = &text[i..];
+        let Some(scheme) = SCHEMES.iter().find(|s| rest.starts_with(**s)) else {
+            i += 1;
+            continue;
+        };
+        let start = i + scheme.len();
+        let end = text[start..]
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`' | '\\'))
+            .map(|offset| start + offset)
+            .unwrap_or(text.len());
+        let candidate = text[start..end].trim_end_matches(['.', ',', ')', ']', ';']);
+        if candidate.contains('.') {
+            out.push(format!("{scheme}{candidate}"));
+        }
+        i = end.max(i + 1);
+    }
+
+    // `local@domain`, requiring an `@` and a dotted domain so that a lone
+    // handle or a decorator-style `@tool` does not qualify.
+    let mut cursor = 0usize;
+    while let Some(at) = text[cursor..].find('@') {
+        let at_index = cursor + at;
+        let head_start = text[..at_index]
+            .rfind(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '(' | ',' | '<'))
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        let head = &text[head_start..at_index];
+        let tail_start = at_index + 1;
+        let tail_end = text[tail_start..]
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ')' | ',' | '>' | ']'))
+            .map(|offset| tail_start + offset)
+            .unwrap_or(text.len());
+        let tail = &text[tail_start..tail_end];
+        if !head.is_empty()
+            && head.chars().all(|c| c.is_ascii_alphanumeric() || "._%+-".contains(c))
+            && tail.contains('.')
+            && tail
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || ".-".contains(c))
+        {
+            out.push(format!("{head}@{tail}"));
+        }
+        cursor = tail_end.max(at_index + 1);
+    }
+
+    out
+}
+
 /// True when the source contains syntax that looks like MCP tool registration.
 fn mentions_mcp_registration(source: &str) -> bool {
     let lower = source.to_ascii_lowercase();
@@ -2328,6 +2424,9 @@ pub fn build_server_dtg(
         merged
             .injection_markers
             .extend(u.injection_markers.iter().cloned());
+        merged
+            .egress_literals
+            .extend(u.egress_literals.iter().cloned());
         for (k, v) in &u.sinks_by_function {
             merged.sinks_by_function.entry(k.clone()).or_default().extend(v);
         }
@@ -2530,6 +2629,35 @@ function render(v) { return String(v); }
         assert!(
             reachable.iter().any(|r| r.sink_kind == SinkKind::NetworkOutbound),
             "an expression-bodied arrow must still reach its sink, got {reachable:?}"
+        );
+    }
+
+    /// Egress literals are destinations the code *names*, not destinations it
+    /// *calls*. `js_malicious_tools.js` exfiltrates through a
+    /// `bcc: [{ email: "collector@attacker.tld" }]` object and makes no network
+    /// call at all, so the literal is the only evidence available.
+    #[test]
+    fn egress_literals_are_collected_from_string_literals_only() {
+        let src = r#"
+const collector = "collector@attacker.tld";
+const hook = "https://exfil.example/leak";
+const local = "/workspace/report.json";
+// a comment mentioning https://ignored.example must not count
+const decorated = "see https://docs.example/api for details";
+"#;
+        let unit = extract_source("lab", "egress.js", Language::JavaScript, src)
+            .expect("extraction must succeed");
+        let found: Vec<&str> = unit.egress_literals.iter().map(|s| s.as_str()).collect();
+        assert!(found.contains(&"collector@attacker.tld"), "{found:?}");
+        assert!(found.contains(&"https://exfil.example/leak"), "{found:?}");
+        assert!(found.contains(&"https://docs.example/api"), "{found:?}");
+        assert!(
+            !found.iter().any(|f| f.contains("ignored.example")),
+            "a comment is not a destination: {found:?}"
+        );
+        assert!(
+            !found.iter().any(|f| f.contains("workspace")),
+            "a bare path is not a destination: {found:?}"
         );
     }
 

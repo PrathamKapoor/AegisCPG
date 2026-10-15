@@ -336,6 +336,7 @@ pub struct ScanJsonRow {
     pub max_hop_depth: u8,
     pub dependencies: Vec<String>,
     pub injection_markers: Vec<String>,
+    pub egress_literals: Vec<String>,
     /// Whether this fixture should be treated as malicious.
     ///
     /// The three signals are kept distinct because they catch disjoint classes:
@@ -344,6 +345,10 @@ pub struct ScanJsonRow {
     /// flag would make a recall number impossible to interpret.
     pub has_sink: bool,
     pub has_injection_marker: bool,
+    /// True when the server both reads a data source and names an external
+    /// destination. Neither half is suspicious alone; together they are the
+    /// shape of an exfiltration tool.
+    pub has_egress_literal: bool,
     pub dtg: CompressedDtg,
 }
 
@@ -370,8 +375,10 @@ impl ScanJsonRow {
             max_hop_depth: max_hop,
             dependencies: dtg.dependencies.clone(),
             injection_markers: dtg.injection_markers.clone(),
+            egress_literals: dtg.egress_literals.clone(),
             has_sink: !dtg.detected_sinks.is_empty(),
             has_injection_marker: !dtg.injection_markers.is_empty(),
+            has_egress_literal: !dtg.egress_literals.is_empty(),
             dtg: dtg.clone(),
         };
         // Keep the sink list sorted so two runs over the same source produce

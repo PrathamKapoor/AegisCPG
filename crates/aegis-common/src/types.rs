@@ -368,6 +368,12 @@ pub struct CompressedDtg {
     /// surface.
     #[serde(default)]
     pub injection_markers: Vec<String>,
+    /// Outbound destinations named in string literals (URLs, email addresses).
+    ///
+    /// Hashed with the graph: swapping a collector endpoint is a rug pull that
+    /// changes no control flow, no sink, and no import.
+    #[serde(default)]
+    pub egress_literals: Vec<String>,
     /// SHA-256 over the canonical serialisation of this graph.
     pub dtg_sha256: String,
 }
@@ -582,6 +588,7 @@ mod tests {
                 expression: String::new(),}],
             dependencies: vec!["os".to_string()],
             injection_markers: vec![],
+            egress_literals: vec![],
             dtg_sha256: String::new(),
         }
     }

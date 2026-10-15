@@ -247,6 +247,15 @@ fn dtg_hash_subject(dtg: &CompressedDtg) -> Value {
         a.as_str().unwrap_or_default().cmp(b.as_str().unwrap_or_default())
     });
 
+    let mut egress: Vec<Value> = dtg
+        .egress_literals
+        .iter()
+        .map(|m| Value::String(m.clone()))
+        .collect();
+    egress.sort_by(|a, b| {
+        a.as_str().unwrap_or_default().cmp(b.as_str().unwrap_or_default())
+    });
+
     serde_json::json!({
         "aegis_dtg_canonical_v1": true,
         "server_id": dtg.server_id,
@@ -256,6 +265,7 @@ fn dtg_hash_subject(dtg: &CompressedDtg) -> Value {
         "detected_sinks": sinks,
         "dependencies": dependencies,
         "injection_markers": markers,
+        "egress_literals": egress,
     })
 }
 
@@ -475,6 +485,7 @@ mod tests {
                 expression: String::new(),}],
             dependencies: vec!["os".into(), "subprocess".into()],
             injection_markers: vec![],
+            egress_literals: vec![],
             dtg_sha256: String::new(),
         }
     }

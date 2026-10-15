@@ -158,6 +158,7 @@ mod tests {
             }],
             dependencies: vec!["os".to_string()],
             injection_markers: vec![],
+            egress_literals: vec![],
             dtg_sha256: String::new(),
         };
         d.dtg_sha256 = canonical_dtg_hash(&d).unwrap();
