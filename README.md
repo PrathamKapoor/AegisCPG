@@ -173,10 +173,16 @@ node --test "apps/web-portal/tests/*.test.mjs"
 
 # 6. Re-measure every number in this README
 .\.toolchain\python\python.exe benchmarks\run_all_benchmarks.py
+
+# 7. Confirm all twelve Hard-Rule gates in one command
+.\.toolchain\python\python.exe scripts\final_audit.py
 ```
 
 Step 6 exits non-zero if any ADR-016 threshold regresses, and still writes its
-outputs so the failure is visible rather than silent.
+outputs so the failure is visible rather than silent. Step 7 checks Rules 1, 2,
+3, 4, 7, 8 and 10 together — containment, sole authorship, no placeholders, no
+LLM, module headers, commit hygiene, and reproducible benchmarks — and exits
+non-zero on any of them. A gate that cannot run is a **failure**, not a skip.
 
 ---
 
@@ -234,7 +240,10 @@ The full list, with how each was found, is in `decisions.md` under *Post-mortem*
 | Rust control plane | `cargo test --workspace` | **233** |
 | Python control plane | `pytest ml-rag-engine/tests` | **82** |
 | Web portal view models | `node --test apps/web-portal/tests` | **18** |
+| Hard-Rule audit | `python scripts/final_audit.py` | 12 gates |
 | Benchmark thresholds | `run_all_benchmarks.py` | 8 assertions |
+
+All 333 tests and all 12 gates pass on this host.
 
 ---
 
