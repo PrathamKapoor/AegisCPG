@@ -29,6 +29,22 @@
 //! available inside a tray process on Windows. The marker is stable; the path is
 //! not.
 //!
+//! ## HOW
+//!
+//! Discovery reads three fixed paths and returns every stdio entry. Wrapping
+//! rewrites the `command` field of each and writes the document back, or
+//! returns [`WrapOutcome::AlreadyWrapped`] and leaves the file byte-identical.
+//! [`LsmStatus::probe`] reads the loader's report when one exists and says so
+//! plainly when it does not.
+//!
+//! A worked example, for the shape the shell passes in:
+//!
+//! ```text
+//! mcp.json before:  {"mcpServers":{"fs":{"command":"python","args":["-m","srv"]}}}
+//! mcp.json after:   {"mcpServers":{"fs":{"command":"<interpreter> -c ... g.serve_stdio(...)",
+//!                                            "args":["-m","srv"]}}}
+//! ```
+//!
 //! Complexity: discovery is O(entries in the three candidate directories);
 //! wrapping is O(size of one JSON document).
 

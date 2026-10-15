@@ -22,23 +22,26 @@ WHY HYBRID, MEASURED
     three helpers below the registration line. Neither the tool's own chunk nor
     the sink's own chunk contains both halves of the evidence.
 
-WHY TWO DENSE PATHS, AND WHY IT MATTERS WHICH ONE RAN
-    ``bge-local``      -- BAAI/bge-small-en-v1.5 from the local cache, used only
-                          when ``sentence_transformers`` is importable AND the
-                          weights are on disk. ``local_files_only=True``; no
-                          network call is ever attempted.
-    ``deterministic-subword-384`` -- a signed feature-hashed projection over
-                          character 3/4/5-grams, camelCase/snake_case subtokens,
-                          and explicit semantic-capability basis anchors.
+WHY ONE DENSE PATH, AND WHY IT MATTERS WHICH ONE RAN
+    ``deterministic-subword-384`` is the only dense path: a signed
+    feature-hashed projection over character 3/4/5-grams,
+    camelCase/snake_case subtokens, and explicit semantic-capability basis
+    anchors.
 
-    Path B exists because a security tool must run on an air-gapped audit host
-    and produce the *same* answer every time. It is a feature-hashing encoder,
-    not a placeholder: the basis anchors are what let a natural-language phrase
-    like "run shell commands" land in a subspace correlated with the
+    It exists because a security tool must run on an air-gapped audit host and
+    produce the *same* answer every time. It is a feature-hashing encoder, not a
+    stand-in: the basis anchors are what let a natural-language phrase like "run
+    shell commands" land in a subspace correlated with the
     ``subprocess``/``execve`` token, which is the actual retrieval signal.
 
-    Every result records ``dense_path``, so a Recall@5 measured on Path A is
-    never silently compared against one measured on Path B.
+    A second path -- `BAAI/bge-small-en-v1.5` through `sentence_transformers` --
+    was removed. It had no ``win_arm64`` wheel, so it could never run on the
+    target host; it made Hard Rule 4 conditional; and a retrieval metric that
+    depends on whether a model cache happened to be populated is not
+    reproducible. See ADR-019.
+
+    Every result still records ``dense_path``. The value has only one possible
+    setting today, and it will still be on the record when it has two.
 
 HOW
     RRF is rank-based and therefore scale-free:
@@ -261,51 +264,34 @@ class DeterministicSubwordEncoder:
         return (vec / norm).astype(np.float32)
 
 
-class BgeLocalEncoder:
-    """BAAI/bge-small-en-v1.5, used only from a local cache.
-
-    ``local_files_only=True`` means an absent cache produces a clean
-    unavailability rather than a download. That matters for a security tool: an
-    auditor on an air-gapped network must get a deterministic answer, not a
-    timeout.
-    """
-
-    name = "bge-local"
-
-    def __init__(self, model_name: str = "BAAI/bge-small-en-v1.5") -> None:
-        self.model_name = model_name
-        self._model = None
-        self.available = False
-        self.unavailable_reason = ""
-        try:  # pragma: no cover - depends on a local model cache
-            from sentence_transformers import SentenceTransformer
-
-            self._model = SentenceTransformer(model_name, local_files_only=True)
-            self.dim = int(self._model.get_sentence_embedding_dimension())
-            self.available = True
-        except Exception as exc:
-            self.unavailable_reason = f"{type(exc).__name__}: {exc}"
-
-    def encode(self, text: str) -> np.ndarray:
-        """Encode, or raise if unavailable. Callers must check `available`."""
-        if not self.available or self._model is None:
-            raise RuntimeError(f"BGE is not available locally: {self.unavailable_reason}")
-        vector = self._model.encode(text, normalize_embeddings=True)  # pragma: no cover
-        return np.asarray(vector, dtype=np.float32)
-
-
 def select_dense_encoder(prefer_bge: bool = True) -> tuple[object, str]:
-    """Choose the dense path: Path A if cached, else Path B.
+    """Choose the dense path.
 
-    Returns ``(encoder, path_name)``. Path B is always constructed, because a
-    caller must never be left without an encoder.
+    There is exactly one: `DeterministicSubwordEncoder`. The parameter is
+    retained so a call site that used to ask for the cached BGE path still reads
+    correctly, and its value is ignored.
+
+    An earlier revision offered a second path -- `BAAI/bge-small-en-v1.5` loaded
+    from a local cache through `sentence_transformers`. It was removed for three
+    reasons that only became clear once the benchmarks ran:
+
+    1. It could never execute on the target host. The package has no
+       ``win_arm64`` wheel, so the air-gapped deployment this repository targets
+       could not install it, and every measured number in the repository came
+       from Path B regardless.
+    2. It made Hard Rule 4 conditional. `sentence_transformers` is not a
+       generative model, so the Rust gate did not object -- but the Python gate
+       did, and a rule that needs an exception is worse than a smaller
+       dependency.
+    3. A retrieval metric that differs depending on whether a model cache
+       happened to be populated is not a reproducible metric. `dense_path` is
+       still reported on every result so the value is never ambiguous, but there
+       is now only one value it can take.
+
+    See ADR-019.
     """
-    fallback = DeterministicSubwordEncoder()
-    if prefer_bge:
-        bge = BgeLocalEncoder()
-        if bge.available:
-            return bge, BgeLocalEncoder.name
-    return fallback, DeterministicSubwordEncoder.name
+    del prefer_bge  # one path; the parameter is kept only for call-site clarity
+    return DeterministicSubwordEncoder(), DeterministicSubwordEncoder.name
 
 
 # ---------------------------------------------------------------------------

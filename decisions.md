@@ -1369,3 +1369,60 @@ crash. A verifier that only raises on error is not a verifier. The defences that
 actually caught these were: a fixture corpus with a known label, an end-to-end
 sweep rather than unit tests alone, and a benchmark that measures the binary
 instead of a transcription of it.
+
+---
+
+## ADR-019 - The sentence-transformers retrieval path is removed
+
+**Status.** Accepted (supersedes the dual-path design in ADR-015)
+**Date.** 2026-10-15
+
+### Context
+
+`hybrid_indexer.py` offered two dense paths behind a `prefer_bge` flag:
+
+* **Path A** -- `BAAI/bge-small-en-v1.5` loaded from a local cache with
+  `local_files_only=True`, through `sentence_transformers`.
+* **Path B** -- a signed feature-hashed projection over character 3/4/5-grams,
+  identifier subtokens, and explicit semantic-capability basis anchors.
+
+Path A existed because a stronger encoder should retrieve better. The final
+audit's zero-LLM gate found it importing `sentence_transformers`, and the
+argument for keeping it collapsed on inspection.
+
+### Decision
+
+Path A is removed. `select_dense_encoder` returns Path B unconditionally; the
+parameter is kept, and ignored, so a call site that asked for BGE still reads
+correctly.
+
+### Why
+
+1. **It could never run on the target host.** `sentence_transformers` has no
+   `win_arm64` wheel. The Snapdragon deployment ADR-015 exists to target cannot
+   install it, so the `try: import` always failed and every measured number in
+   the repository already came from Path B. The code was a branch that had never
+   executed.
+2. **It made Hard Rule 4 conditional.** BGE-small is a sentence *encoder*, not a
+   generative model, so the Rust gate (`no_generative_dependency_is_reachable`)
+   did not object. The Python gate did. A rule that needs an exception is worse
+   than a smaller dependency, and the exception would have to be re-justified
+   every time the gate list changed.
+3. **It made the retrieval metric non-reproducible.** A nDCG measured with the
+   cache populated and one measured without it are different numbers, and nothing
+   in the output distinguished them beyond a `dense_path` string that a reader
+   has to know to check. Every number the benchmark reports would have depended
+   on whether an unrelated model cache happened to be warm.
+
+### Consequences
+
+* `BgeLocalEncoder` is gone. `select_dense_encoder` is three lines.
+* `dense_path` is still reported on every result. It has one possible value today
+  and will still be on the record when it has two -- which is the property that
+  made the two-path design worth having in the first place.
+* The reported `dense_path` in `benchmarks/results/summary_metrics.json` was
+  already `deterministic-subword-384` on every run, so no measured number
+  changes.
+* `test_rag_milp_workflow.py::test_both_dense_paths_are_reported` keeps its name
+  and its assertion: the path is reported, and it is one of the two documented
+  values. The second can no longer occur, which the test does not require.
