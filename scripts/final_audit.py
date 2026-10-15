@@ -157,7 +157,7 @@ def gate_containment() -> Gate:
         for match in escape.finditer(shipped):
             line_start = shipped.rfind("\n", 0, match.start()) + 1
             line = shipped[line_start : shipped.find("\n", match.start())]
-            if line.lstrip().startswith(("#", "//", "///", "//!"))
+            if line.lstrip().startswith(("#", "//", "///", "//!")):
                 continue  # a comment naming an example path is documentation
             gate.require(
                 False,
@@ -377,10 +377,16 @@ def gate_rust_tests() -> Gate:
 
 
 def gate_python_tests() -> Gate:
-    """The Python control plane passes."""
+    """The Python control plane passes.
+
+    Note the absence of `-q`. pytest 9 suppresses the final ``N passed`` line
+    under quiet mode, so a `-q` run prints only progress dots and the count has
+    to be inferred -- which is why the first version of this gate reported zero
+    tests against a suite of eighty-two that had all just passed.
+    """
     gate = Gate("Python test suite (pytest)")
     completed = run(
-        [str(PYTHON), "-m", "pytest", "ml-rag-engine/tests", "-q", "-p", "no:cacheprovider"],
+        [str(PYTHON), "-m", "pytest", "ml-rag-engine/tests", "-p", "no:cacheprovider"],
         timeout=3600,
     )
     output = completed.stdout + completed.stderr
