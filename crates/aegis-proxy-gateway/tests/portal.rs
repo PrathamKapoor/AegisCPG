@@ -759,6 +759,112 @@ async fn the_cypher_endpoint_refuses_queries_that_leave_the_subset() {
 }
 
 // ---------------------------------------------------------------------------
+// The live code-to-eBPF sandbox, over HTTP
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_live_sandbox_runs_the_pipeline_over_posted_source() {
+    let server = TestServer::start(portal_state).await;
+
+    // The presets endpoint the portal loads its examples from: five, each with
+    // the outcome it claims, so a drifted example fails the binary's own tests.
+    let presets = server.request("GET", "/api/live-analyze/presets").await;
+    assert_eq!(presets.status, 200, "{}", presets.text());
+    let presets = presets.json();
+    let presets = presets["presets"]
+        .as_array()
+        .expect("an array of presets")
+        .clone();
+    assert_eq!(presets.len(), 5, "{presets:?}");
+
+    // Run the first preset exactly as the page will: every value comes from the
+    // server's own manifest, not from constants in this file.
+    let preset = &presets[0];
+    let live_body = |server_id: &str| {
+        json!({
+            "source": preset["source"],
+            "language": preset["language"],
+            "server_id": server_id,
+            "clearance": preset["clearance"],
+            "hook": preset["hook"],
+            "target": preset["target"],
+        })
+    };
+    let response = server
+        .post_json("/api/live-analyze", &live_body("portal-live"))
+        .await;
+    assert_eq!(response.status, 200, "{}", response.text());
+    let body = response.json();
+    assert_eq!(body["server_id"], "portal-live");
+    assert_eq!(body["language"], preset["language"]);
+    assert!(
+        body["cgroup_id"]
+            .as_str()
+            .expect("the cgroup id is a string, so a 64-bit id cannot round in a browser")
+            .chars()
+            .all(|c| c.is_ascii_digit()),
+        "{}",
+        body["cgroup_id"]
+    );
+    assert_eq!(body["stage2"]["verdict"], preset["expected"]["verdict"]);
+    assert_eq!(body["stage3"]["safe"], preset["expected"]["safe"]);
+    assert_eq!(
+        body["stage4"]["simulator_verdict"],
+        preset["expected"]["kernel"]
+    );
+    assert_eq!(body["stage4"]["vm_verdict"], preset["expected"]["kernel"]);
+    assert_eq!(body["stage4"]["agree"], true);
+    assert_eq!(body["stage4"]["verified"], true);
+    assert!(
+        !body["stage4"]["disassembly"]
+            .as_array()
+            .expect("a listing")
+            .is_empty(),
+        "the panel renders the disassembly"
+    );
+    assert!(
+        body["stage3"]["paseto_token"]
+            .as_str()
+            .expect("a token")
+            .starts_with("v3.public."),
+        "{}",
+        body["stage3"]["paseto_token"]
+    );
+
+    // The analysis is stateless: the live server is not added to the catalog,
+    // so the graph endpoint still 404s for it. A POST must not rewrite the
+    // gateway's served state.
+    let graph = server.request("GET", "/api/graph/portal-live").await;
+    assert_eq!(graph.status, 404, "{}", graph.text());
+
+    // A refused request carries the fix, never a partial analysis.
+    let refused = server
+        .post_json(
+            "/api/live-analyze",
+            &json!({ "source": "x = 1", "language": "brainfuck" }),
+        )
+        .await;
+    assert_eq!(refused.status, 400, "{}", refused.text());
+    assert!(
+        refused.json()["error"]
+            .as_str()
+            .expect("an error message")
+            .contains("unsupported language"),
+        "{}",
+        refused.text()
+    );
+
+    // Running it again is fine and stays consistent: one more 200, same body
+    // shape, and still nothing added to the catalog.
+    let again = server
+        .post_json("/api/live-analyze", &live_body("portal-live"))
+        .await;
+    assert_eq!(again.status, 200, "{}", again.text());
+    let graph = server.request("GET", "/api/graph/portal-live").await;
+    assert_eq!(graph.status, 404, "{}", graph.text());
+}
+
+// ---------------------------------------------------------------------------
 // The taint flow, over HTTP, end to end
 // ---------------------------------------------------------------------------
 

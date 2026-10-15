@@ -35,6 +35,10 @@
 //!   against the region actually addressed (context, stack frame, map value),
 //!   so a scalar used as a pointer is a runtime trap, not a read of host
 //!   memory. Fuel bounds every run, so a compiler bug cannot hang a test.
+//! * [`disassemble`] is the assembler's inverse and [`disassembly_listing`]
+//!   its objdump-style rendering: what the portal shows is reassembled and
+//!   byte-compared against the executed program in the tests, so the listing
+//!   cannot drift from the bytecode.
 //!
 //! Out of scope, and rejected rather than approximated: BTF type info,
 //! relocations (a wide-immediate load names a map id directly), tail calls,
@@ -753,6 +757,200 @@ pub(crate) fn classify(insn: &Insn) -> Option<Class> {
         }
         _ => None,
     }
+}
+
+/// Whether the opcode writes a 64-bit register (`rN`) or a 32-bit one (`wN`).
+fn register_name(register: u8, wide: bool) -> String {
+    format!("{}{register}", if wide { 'r' } else { 'w' })
+}
+
+/// A signed displacement as the dialect writes it (`+3`, `-8`).
+fn signed_offset(offset: i16) -> String {
+    if offset < 0 {
+        format!("-{}", offset.unsigned_abs())
+    } else {
+        format!("+{offset}")
+    }
+}
+
+/// A memory operand, LLVM-style: `*(u32 *)(r10 - 8)`.
+fn memory_operand(size: usize, base: u8, offset: i16) -> String {
+    format!(
+        "*(u{} *)(r{base} {} {})",
+        size * 8,
+        if offset < 0 { "-" } else { "+" },
+        offset.unsigned_abs()
+    )
+}
+
+/// The operator symbol of a compound assignment, as the dialect writes it.
+///
+/// `Neg` and `Mov` are listed for totality only: they take the unary and plain
+/// assignment forms, which `render_slot` matches before it ever asks for a
+/// compound symbol.
+fn alu_symbol(op: AluOp) -> &'static str {
+    match op {
+        AluOp::Add => "+",
+        AluOp::Sub => "-",
+        AluOp::Mul => "*",
+        AluOp::Div => "/",
+        AluOp::Or => "|",
+        AluOp::And => "&",
+        AluOp::Lsh => "<<",
+        AluOp::Rsh => ">>",
+        AluOp::Mod => "%",
+        AluOp::Xor => "^",
+        AluOp::Arsh => "s>>",
+        AluOp::Neg => "-",
+        AluOp::Mov => "=",
+    }
+}
+
+/// The comparison symbol of a conditional jump, as the dialect writes it.
+///
+/// `Ja`, `Call` and `Exit` are listed for totality only: they take the `goto`,
+/// `call` and `exit` forms, which `render_slot` matches before this is asked.
+fn jump_symbol(op: JmpOp) -> &'static str {
+    match op {
+        JmpOp::Jeq => "==",
+        JmpOp::Jne => "!=",
+        JmpOp::Jgt => ">",
+        JmpOp::Jlt => "<",
+        JmpOp::Jge => ">=",
+        JmpOp::Jle => "<=",
+        JmpOp::Jsgt => "s>",
+        JmpOp::Jslt => "s<",
+        JmpOp::Jsge => "s>=",
+        JmpOp::Jsle => "s<=",
+        JmpOp::Jset => "&",
+        JmpOp::Ja => "",
+        JmpOp::Call => "",
+        JmpOp::Exit => "",
+    }
+}
+
+/// Renders one slot in the dialect [`assemble`] accepts.
+///
+/// `hi` is the slot after `insn`, needed only for a wide load. The mappings are
+/// exactly the inverses of the `parse_*` family above: every field that
+/// affected the encoding is text again, and nothing else is.
+fn render_slot(insn: &Insn, hi: Option<&Insn>, pc: usize) -> Result<String, VerifyError> {
+    let class = classify(insn).ok_or(VerifyError::UndefinedOpcode { pc, opcode: insn.opcode })?;
+    Ok(match class {
+        Class::Lddw => {
+            let hi = hi.ok_or(VerifyError::LddwWithoutSlot { pc })?;
+            if hi.opcode != 0 {
+                return Err(VerifyError::BadWideImmediateSlot { pc: pc + 1 });
+            }
+            format!("r{} = {} ll", insn.dst, insn.imm64(hi))
+        }
+        Class::Ldx { size } => format!(
+            "r{} = {}",
+            insn.dst,
+            memory_operand(size, insn.src, insn.off)
+        ),
+        Class::St { size } => {
+            format!("{} = {}", memory_operand(size, insn.dst, insn.off), insn.imm)
+        }
+        Class::Stx { size } => format!(
+            "{} = r{}",
+            memory_operand(size, insn.dst, insn.off),
+            insn.src
+        ),
+        Class::Alu { op: AluOp::Neg, wide, .. } => {
+            let register = register_name(insn.dst, wide);
+            format!("{register} = -{register}")
+        }
+        Class::Alu { op: AluOp::Mov, wide, from_reg } => {
+            let operand = if from_reg {
+                register_name(insn.src, wide)
+            } else {
+                insn.imm.to_string()
+            };
+            format!("{} = {operand}", register_name(insn.dst, wide))
+        }
+        Class::Alu { op, wide, from_reg } => {
+            let operand = if from_reg {
+                register_name(insn.src, wide)
+            } else {
+                insn.imm.to_string()
+            };
+            format!(
+                "{} {}= {operand}",
+                register_name(insn.dst, wide),
+                alu_symbol(op)
+            )
+        }
+        Class::End { big_endian, width } => format!(
+            "r{} = {}{width} r{}",
+            insn.dst,
+            if big_endian { "be" } else { "le" },
+            insn.dst
+        ),
+        Class::Jump { op: JmpOp::Ja, .. } => format!("goto {}", signed_offset(insn.off)),
+        Class::Jump { op: JmpOp::Exit, .. } => "exit".to_string(),
+        Class::Jump { op: JmpOp::Call, .. } => format!("call {}", insn.imm),
+        Class::Jump { op, wide, from_reg } => {
+            let operand = if from_reg {
+                register_name(insn.src, wide)
+            } else {
+                insn.imm.to_string()
+            };
+            format!(
+                "if {} {} {operand} goto {}",
+                register_name(insn.dst, wide),
+                jump_symbol(op),
+                signed_offset(insn.off)
+            )
+        }
+    })
+}
+
+/// Renders every slot in order, as `(first slot index, text)`, skipping the
+/// second slot of a wide load (its high word is folded into the `ll` line).
+fn rendered_slots(insns: &[Insn]) -> Result<Vec<(usize, String)>, VerifyError> {
+    let mut out = Vec::new();
+    let mut pc = 0usize;
+    while pc < insns.len() {
+        let insn = &insns[pc];
+        out.push((pc, render_slot(insn, insns.get(pc + 1), pc)?));
+        pc += if insn.opcode == opcode::LDDW { 2 } else { 1 };
+    }
+    Ok(out)
+}
+
+/// Re-renders decoded instructions as assembler source.
+///
+/// The inverse of [`assemble`] over everything [`classify`] recognises: the
+/// returned lines reassemble to exactly the bytes they were decoded from, so a
+/// listing a reviewer reads is provably the program the VM executes. A wide
+/// load is one `ll` line at the pair's first slot; a slot the verifier would
+/// reject is an error here rather than a guess.
+pub fn disassemble(insns: &[Insn]) -> Result<Vec<String>, VerifyError> {
+    Ok(rendered_slots(insns)?.into_iter().map(|(_, text)| text).collect())
+}
+
+/// A disassembly listing: `NNNN: (oo) text`, one line per instruction.
+///
+/// The slot index and raw opcode come first so the listing can be checked
+/// against `llvm-objdump` byte for byte; calls carry their helper name
+/// (`call bpf_map_lookup_elem#1`, the UAPI spelling) because an id alone is
+/// exactly the field a reviewer cannot verify by reading.
+pub fn disassembly_listing(insns: &[Insn]) -> Result<Vec<String>, VerifyError> {
+    Ok(rendered_slots(insns)?
+        .into_iter()
+        .map(|(pc, text)| {
+            let insn = &insns[pc];
+            let rendered = match classify(insn) {
+                Some(Class::Jump { op: JmpOp::Call, .. }) => match helper_name(insn.imm) {
+                    Some(name) => format!("call {name}#{}", insn.imm),
+                    None => format!("call #{}", insn.imm),
+                },
+                _ => text,
+            };
+            format!("{pc:04}: ({:02x}) {rendered}", insn.opcode)
+        })
+        .collect())
 }
 
 /// A program the verifier refuses to let execute.
@@ -2332,7 +2530,7 @@ mod tests {
     /// LLVM's. `llvm-mc` is the external oracle here: if my encoder and LLVM's
     /// disagree on any of these, the VM would execute a different program than
     /// one a real kernel loader would load.
-    const CORPUS: [&str; 59] = [
+    const CORPUS: [&str; 65] = [
         "r1 = 4660",
         "r1 = -1",
         "r1 = -5",
@@ -2388,6 +2586,12 @@ mod tests {
         "if w1 != 0 goto +1",
         "if w1 > 5 goto +1",
         "if w1 s< 0 goto +1",
+        "r1 = be16 r1",
+        "r1 = be32 r1",
+        "r1 = be64 r1",
+        "r1 = le16 r1",
+        "r1 = le32 r1",
+        "r1 = le64 r1",
         "r1 = 0x1122334455667788 ll",
         "r1 = 4660 ll",
         "call 1",
@@ -2451,6 +2655,97 @@ mod tests {
         assert_eq!(insns[0].opcode, opcode::LDDW);
         assert_eq!(insns[0].imm64(&insns[1]), 0x1122334455667788);
         assert_eq!(insns[1].opcode, 0);
+    }
+
+    #[test]
+    fn disassembly_round_trips_the_whole_instruction_corpus() {
+        // The corpus is already proven byte-identical to LLVM's encodings, so
+        // reassembling the disassembly of the corpus and getting the same
+        // bytes proves the rendering is lossless for every form the assembler
+        // accepts -- the property the portal's listing relies on.
+        let bytes = assemble(&CORPUS.join("\n")).expect("the corpus must assemble");
+        let insns = decode(&bytes).unwrap();
+        let text = disassemble(&insns).expect("the corpus must disassemble");
+        let reassembled = assemble(&text.join("\n")).expect("the rendering must reassemble");
+        assert_eq!(reassembled, bytes, "the disassembly must be lossless");
+
+        // Spot-check the rendering itself, not just its round trip: a listing
+        // that reassembles but reads wrongly is still a wrong listing.
+        let rendered = text.join("\n");
+        assert!(rendered.contains("r1 = 1234605616436508552 ll"), "{rendered}");
+        assert!(rendered.contains("*(u32 *)(r10 - 4) = r1"), "{rendered}");
+        assert!(rendered.contains("if r1 & 3 goto +1"), "{rendered}");
+        assert!(rendered.contains("if w1 s< 0 goto +1"), "{rendered}");
+        assert!(rendered.contains("r1 = be16 r1"), "{rendered}");
+        assert!(rendered.contains("r1 = be64 r1"), "{rendered}");
+        assert!(rendered.contains("r1 = le64 r1"), "{rendered}");
+        assert!(rendered.contains("goto -3"), "{rendered}");
+    }
+
+    #[test]
+    fn disassembly_round_trips_and_lists_the_three_decision_programs() {
+        for program in [BPRM_CHECK_SECURITY_ASM, FILE_OPEN_ASM, SOCKET_CONNECT_ASM] {
+            let bytes = assemble(program).unwrap();
+            let insns = decode(&bytes).unwrap();
+            verify(&insns).expect("the decision programs must verify");
+            let text = disassemble(&insns).expect("a verified program must disassemble");
+            assert_eq!(
+                assemble(&text.join("\n")).unwrap(),
+                bytes,
+                "the decision program's disassembly must reassemble byte-for-byte"
+            );
+
+            let listing = disassembly_listing(&insns).expect("a verified program must list");
+            assert_eq!(listing.len(), text.len(), "one listing line per rendered slot");
+            assert_eq!(
+                listing[0],
+                format!("0000: ({:02x}) {}", insns[0].opcode, text[0]),
+                "the listing pins the slot index and opcode, not just the text"
+            );
+            assert!(
+                listing.iter().any(|line| line.contains("call bpf_map_lookup_elem#1")),
+                "a helper call must be named, not just numbered:\n{}",
+                listing.join("\n")
+            );
+            // Every listing line is `NNNN: (oo) text` with a 4-digit slot.
+            for line in &listing {
+                assert!(
+                    line.len() > 8
+                        && line.as_bytes()[4] == b':'
+                        && line.as_bytes()[5] == b' '
+                        && line.as_bytes()[6] == b'('
+                        && line.as_bytes()[9] == b')',
+                    "{line:?} is not a listing line"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn disassembly_refuses_slots_the_verifier_would_reject() {
+        // Nothing is rendered by guessing: an unknown opcode, a wide load cut
+        // off by the end of the program, and a wide load whose second slot is
+        // not a bare high-word carrier are all errors, mirroring `verify`.
+        let unknown = [Insn::new(0xff, 1, 0, 0, 0)];
+        assert_eq!(
+            disassemble(&unknown),
+            Err(VerifyError::UndefinedOpcode { pc: 0, opcode: 0xff })
+        );
+        let truncated = [Insn::new(opcode::LDDW, 1, 0, 0, 7)];
+        assert_eq!(
+            disassemble(&truncated),
+            Err(VerifyError::LddwWithoutSlot { pc: 0 })
+        );
+        let bad_hi = [
+            Insn::new(opcode::LDDW, 1, 0, 0, 7),
+            Insn::new(opcode::LDDW, 0, 0, 0, 0),
+        ];
+        assert_eq!(
+            disassemble(&bad_hi),
+            Err(VerifyError::BadWideImmediateSlot { pc: 1 })
+        );
+        // An empty program has nothing to render; `verify` is what rejects it.
+        assert_eq!(disassemble(&[]), Ok(Vec::new()));
     }
 
     // ------------------------------------------------------------------

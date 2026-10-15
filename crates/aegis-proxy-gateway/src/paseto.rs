@@ -248,6 +248,14 @@ impl PasetoIssuer {
         self.key.public_key_hex()
     }
 
+    /// The signing key, for the one other artefact this process signs with the
+    /// same identity: the live sandbox's TACR (`POST /api/live-analyze`), which
+    /// must verify against the public half `/oauth/keys` publishes. A reference
+    /// is returned, not a copy: the key is process state, not a value.
+    pub fn signing_key(&self) -> &AegisSigningKey {
+        &self.key
+    }
+
     /// The SPKI-thumbprint key id, useful in logs and key rotation.
     pub fn key_id(&self) -> String {
         self.key.key_id()
@@ -455,6 +463,24 @@ mod tests {
         let a = iss.issue("c", "s", NOW).unwrap();
         let b = iss.issue("c", "s", NOW).unwrap();
         assert_ne!(a, b);
+    }
+
+    /// The accessor the live sandbox signs TACRs with must expose the same key
+    /// whose public half `public_key_hex` reports -- otherwise a TACR and a
+    /// PASETO token minted by one gateway would not verify under one pin.
+    #[test]
+    fn the_signing_key_accessor_is_the_key_behind_public_key_hex() {
+        let iss = issuer();
+        let key = iss.signing_key();
+        assert_eq!(key.public_key_hex(), iss.public_key_hex());
+        assert_eq!(key.key_id(), iss.key_id());
+        let signature = key.sign(b"live-analyze").unwrap();
+        aegis_common::crypto::verify_es256(
+            b"live-analyze",
+            &signature,
+            &iss.public_key_hex(),
+        )
+        .expect("the accessor's signatures verify under the published key");
     }
 
     #[test]

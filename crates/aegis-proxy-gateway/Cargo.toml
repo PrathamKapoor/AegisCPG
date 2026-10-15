@@ -26,6 +26,15 @@ path = "src/main.rs"
 
 [dependencies]
 aegis-common.workspace = true
+# Stage 1 is a normal dependency of the library, not a test-only one: the
+# live code-to-eBPF sandbox (`POST /api/live-analyze`) runs the real extractor
+# in process, and a dependency that exists only in tests would mean the
+# endpoint shipped with a different pipeline than the suite exercises.
+aegis-dtg-parser.workspace = true
+# Stage 3 and the Stage 4 preparation, for the same reason: the sandbox
+# verifies the graph it just extracted and signs the TACR it just verified.
+aegis-smt-verifier.workspace = true
+aegis-ebpf-loader.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 axum = "0.7"
@@ -41,5 +50,7 @@ futures-core = "0.3"
 [dev-dependencies]
 # The live integration tests build their Data Transformation Graphs with the
 # real Stage 1 extractor rather than hand-written literals, so a Cypher query is
-# always executed against the same graph shape the pipeline emits.
-aegis-dtg-parser.workspace = true
+# always executed against the same graph shape the pipeline emits. The extractor
+# is a normal dependency above for the live sandbox; this section stays empty
+# unless a test needs something the library does not, and an empty section is
+# the honest state, not a stub.

@@ -8,19 +8,23 @@
 
   WHAT: Renders the live DTG for a chosen server as a 3D constellation of data
         states (nodes) and transforming functions (edges), streams every
-        enforcement decision over SSE, and runs Cypher-subset queries against
-        the same graph the verifier checked.
+        enforcement decision over SSE, runs Cypher-subset queries against
+        the same graph the verifier checked, and hosts the live code-to-eBPF
+        sandbox, which runs all four analysis stages over pasted source and
+        renders the executed decision program's disassembly.
 
   WHY:  Raw WebGL and zero external assets, deliberately. This page is served
         by the binary that holds the capability table; a single <script src>
         pointing at a CDN would hand a third party code execution inside the
         control plane's origin. Everything this page needs is in this file and
-        the two /api endpoints it calls.
+        the /api endpoints it calls.
 
   HOW:  Layered radial layout -- BFS depth from the taint sources becomes the
         ring radius, the lattice level becomes the Z column, sinks are drawn
         larger. Left panel: servers, metrics, sink inventory. Right panel:
         live decision feed. Bottom: Cypher box over POST /api/cypher/query.
+        Centre overlay: the sandbox, which posts to /api/live-analyze and
+        feeds the graph it gets back into the same renderer.
 -->
 <html lang="en">
 <head>
@@ -39,6 +43,18 @@
   #left { top: 14px; left: 14px; width: 300px; max-height: calc(100vh - 240px); overflow-y: auto; }
   #right { top: 14px; right: 14px; width: 330px; max-height: calc(100vh - 240px); overflow-y: auto; }
   #bottom { left: 14px; right: 14px; bottom: 14px; }
+  #sandbox { top: 14px; left: 340px; right: 360px; bottom: 190px; overflow-y: auto; }
+  #sandbox .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 8px; }
+  #sandbox .box { border: 1px solid #1e293b; border-radius: 8px; padding: 8px 10px; }
+  #sandbox .box h2 { margin-top: 0; }
+  #sandbox textarea { min-height: 96px; font-size: 12px; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px;
+           border: 1px solid #334155; }
+  .badge.ok { color: #4ade80; border-color: #14532d; }
+  .badge.bad { color: #f87171; border-color: #7f1d1d; }
+  pre.listing { max-height: 170px; overflow: auto; margin: 6px 0 0; padding: 6px 8px;
+                background: #070b14; border: 1px solid #1e293b; border-radius: 6px;
+                font-size: 11px; line-height: 1.35; }
   h1 { font-size: 14px; margin: 0 0 2px; color: #e2e8f0; letter-spacing: .04em; }
   h2 { font-size: 11px; margin: 14px 0 6px; color: #64748b; text-transform: uppercase;
        letter-spacing: .12em; }
@@ -100,6 +116,39 @@
 <div class="panel" id="right">
   <h2>Live decisions <span class="muted">(SSE)</span></h2>
   <div class="feed" id="feed"></div>
+</div>
+
+<div class="panel" id="sandbox">
+  <h2>Live code &rarr; eBPF sandbox <span class="muted">(stages 1-4, no model)</span></h2>
+  <div class="row" id="presets"></div>
+  <div class="row">
+    <select id="lang" title="Source language">
+      <option value="javascript" selected>javascript</option>
+      <option value="typescript">typescript</option>
+      <option value="python">python</option>
+      <option value="rust">rust</option>
+      <option value="go">go</option>
+    </select>
+    <select id="clearance" title="Clearance of the deployment target">
+      <option value="PUBLIC">PUBLIC</option>
+      <option value="INTERNAL">INTERNAL</option>
+      <option value="CONFIDENTIAL" selected>CONFIDENTIAL</option>
+      <option value="SECRET">SECRET</option>
+    </select>
+    <select id="hook" title="LSM hook to replay">
+      <option value="file_open" selected>file_open</option>
+      <option value="bprm">bprm</option>
+      <option value="socket">socket</option>
+    </select>
+  </div>
+  <div class="row">
+    <input id="target" value="/workspace/notes.md" spellcheck="false" title="Syscall target: an absolute path, or a dotted-quad IPv4 address for the socket hook">
+    <button id="analyze" style="max-width:120px">Analyze</button>
+    <button id="clear" style="max-width:70px">Clear</button>
+  </div>
+  <textarea id="code" spellcheck="false" placeholder="Click a preset, or paste an MCP server source file (python / javascript / typescript / rust / go)"></textarea>
+  <div id="sandbox-status" class="muted">Stage 1 extracts the DTG, Stage 2 measures intent divergence, Stage 3 verifies and signs, Stage 4 executes the decision bytecode. Ctrl+Enter runs it.</div>
+  <div id="sandbox-out"></div>
 </div>
 
 <div class="panel" id="bottom">
@@ -453,6 +502,151 @@ document.getElementById("run").addEventListener("click", async () => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Live code-to-eBPF sandbox: POST /api/live-analyze.
+//
+// The presets are fetched from the binary (GET /api/live-analyze/presets), not
+// written here: each one is pinned by a Rust test against the outcome it
+// claims, so the examples on screen cannot drift from what the pipeline does.
+// ---------------------------------------------------------------------------
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" }[c]));
+}
+function badge(text, cls) { return `<span class="badge ${cls}">${text}</span>`; }
+function kv(label, value) {
+  return `<div class="kv"><span>${label}</span><span>${value}</span></div>`;
+}
+
+async function loadPresets() {
+  const row = document.getElementById("presets");
+  try {
+    const payload = await (await fetch("/api/live-analyze/presets")).json();
+    row.innerHTML = "";
+    for (const preset of payload.presets || []) {
+      const button = document.createElement("button");
+      button.textContent = preset.title;
+      button.title = preset.explanation;
+      button.addEventListener("click", () => applyPreset(preset));
+      row.appendChild(button);
+    }
+  } catch (error) {
+    row.textContent = `presets unavailable: ${error}`;
+  }
+}
+
+function applyPreset(preset) {
+  document.getElementById("code").value = preset.source;
+  document.getElementById("lang").value = preset.language;
+  document.getElementById("clearance").value = preset.clearance;
+  document.getElementById("hook").value = preset.hook;
+  document.getElementById("target").value = preset.target;
+  document.getElementById("sandbox-status").textContent = preset.explanation;
+}
+
+function renderLiveAnalyze(body) {
+  const status = document.getElementById("sandbox-status");
+  const out = document.getElementById("sandbox-out");
+  const s1 = body.stage1, s2 = body.stage2, s3 = body.stage3, s4 = body.stage4;
+  status.textContent = `${body.server_id} \u00b7 ${body.language} \u00b7 cgroup ${body.cgroup_id} ` +
+    `\u00b7 ${body.timings.total_us} \u00b5s total (${body.timings.stage1_us}/${body.timings.stage2_us}/` +
+    `${body.timings.stage3_us}/${body.timings.stage4_us} per stage)`;
+  const sinkChips = s1.detected_sinks.map(s => badge(s.sink_kind, "")).join(" ") ||
+    "<span class='muted'>none reachable</span>";
+  const markers = s2.injection_markers.length
+    ? s2.injection_markers.map(escapeHtml).join(", ") : "none";
+  const literals = s2.sensitive_literals.length
+    ? s2.sensitive_literals.map(escapeHtml).join(", ") : "none";
+  const properties = s3.property_checks.map(p =>
+    kv(p.property, badge(p.status, p.status === "verified" ? "ok" : "bad"))).join("");
+  const witness = s3.witness
+    ? `${escapeHtml(s3.witness.violated_property)}: ${escapeHtml(s3.witness.source_tool)} ` +
+      `&rarr; ${escapeHtml(s3.witness.sink_tool)}`
+    : "no counterexample found";
+  const maps = s4.maps;
+  out.innerHTML = `
+    <div class="grid">
+      <div class="box">
+        <h2>Stage 1 &middot; DTG</h2>
+        ${kv("nodes / edges", `${s1.node_count} / ${s1.edge_count}`)}
+        ${kv("compression", `${(s1.compression_ratio * 100).toFixed(1)}% from ${s1.raw_cpg_node_count}`)}
+        ${kv("dtg sha256", `<span class="muted">${escapeHtml(s1.dtg_sha256.slice(0, 16))}\u2026</span>`)}
+        ${kv("cypher rows", `${s1.cypher_rows} on the query below`)}
+        <div style="margin-top:6px">${sinkChips}</div>
+        <div class="muted" style="margin-top:6px">${escapeHtml(s1.cypher)}</div>
+      </div>
+      <div class="box">
+        <h2>Stage 2 &middot; intent ${badge(s2.verdict, s2.verdict === "flagged" ? "bad" : "ok")}</h2>
+        ${kv("divergence", s2.divergence_ratio.toFixed(2))}
+        ${kv("entropy", `${s2.shannon_entropy_bits_per_byte.toFixed(2)} bits/byte`)}
+        ${kv("reached", escapeHtml(s2.reached_sinks.join(", ") || "none"))}
+        ${kv("declared", escapeHtml(s2.declared_sinks.join(", ") || "none"))}
+        ${kv("markers", markers)}
+        ${kv("sensitive", literals)}
+        <div class="muted" style="margin-top:6px">${escapeHtml(s2.rationale)}</div>
+      </div>
+      <div class="box">
+        <h2>Stage 3 &middot; SMT ${badge(s3.safe ? "UNSAT \u00b7 safe" : "SAT \u00b7 violation", s3.safe ? "ok" : "bad")}</h2>
+        ${properties}
+        ${kv("solver", escapeHtml(s3.solver))}
+        ${kv("downstream", `${s3.downstream.datum_label} &rarr; ${s3.downstream.server_clearance} ` +
+          (s3.downstream.allowed ? "allowed" : "blocked"))}
+        ${kv("witness", witness)}
+        ${kv("tacr", `<span class="muted">${escapeHtml(s3.tacr.tacr_sha256.slice(0, 16))}\u2026</span>`)}
+        ${kv("paseto", `<span class="muted">${escapeHtml(s3.paseto_token.slice(0, 30))}\u2026</span>`)}
+      </div>
+      <div class="box">
+        <h2>Stage 4 &middot; eBPF ${badge(s4.vm_verdict, s4.vm_verdict === "ALLOW" ? "ok" : "bad")}
+          ${badge(`verify ${s4.verified ? "ok" : "fail"}`, s4.verified ? "ok" : "bad")}
+          ${s4.agree ? badge("2-way agree", "ok") : badge("engines disagree", "bad")}</h2>
+        ${kv("hook", escapeHtml(s4.hook))}
+        ${kv("target", escapeHtml(s4.target))}
+        ${kv("simulator / vm", `${s4.simulator_verdict} / ${s4.vm_verdict}`)}
+        ${kv("maps", `policy ${maps.policy_entries} \u00b7 exec ${maps.registry_entries} \u00b7 ` +
+          `allow ${maps.allow_prefixes} \u00b7 deny ${maps.deny_prefixes} \u00b7 net ${maps.net_destinations}`)}
+        <div class="muted" style="margin-top:4px">${s4.bytecode_hex.length / 2} bytes executed, disassembled:</div>
+        <pre class="listing">${s4.disassembly.map(escapeHtml).join("\n")}</pre>
+      </div>
+    </div>`;
+  buildScene(body.graph);
+}
+
+async function runLiveAnalyze() {
+  const status = document.getElementById("sandbox-status");
+  const out = document.getElementById("sandbox-out");
+  status.textContent = "running stages 1-4\u2026";
+  out.innerHTML = "";
+  try {
+    const response = await fetch("/api/live-analyze", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        source: document.getElementById("code").value,
+        language: document.getElementById("lang").value,
+        clearance: document.getElementById("clearance").value,
+        hook: document.getElementById("hook").value,
+        target: document.getElementById("target").value,
+      }),
+    });
+    const body = await response.json();
+    if (!response.ok) { status.textContent = `refused: ${body.error}`; return; }
+    renderLiveAnalyze(body);
+  } catch (error) {
+    status.textContent = `request failed: ${error}`;
+  }
+}
+
+document.getElementById("analyze").addEventListener("click", runLiveAnalyze);
+document.getElementById("clear").addEventListener("click", () => {
+  document.getElementById("code").value = "";
+  document.getElementById("sandbox-out").innerHTML = "";
+  document.getElementById("sandbox-status").textContent =
+    "cleared; paste a source or click a preset";
+});
+document.getElementById("code").addEventListener("keydown", event => {
+  if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) runLiveAnalyze();
+});
+
+loadPresets();
 loadServers();
 pollMetrics();
 setInterval(pollMetrics, 2000);

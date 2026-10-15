@@ -26,7 +26,8 @@
 //! onto them without touching the filesystem. The `tests` module below pins
 //! the served bytes: total length and closing tag (a truncated include would
 //! serve a blank page with a 200), absence of external origins, the WebGL
-//! primitives and endpoints the command center claims to use, the WebAuthn
+//! primitives and endpoints the command center claims to use, the sandbox
+//! overlay's live-pipeline wiring, the WebAuthn
 //! ceremony and DER-to-raw conversion the PWA performs, the manifest's
 //! installability fields, and -- over the service worker's code with comments
 //! stripped -- that its cache shell lists only `/mobile*` routes, never
@@ -87,6 +88,34 @@ mod tests {
         assert!(INDEX_HTML.contains("/api/events"), "the SSE feed");
         assert!(INDEX_HTML.contains("/api/cypher/query"), "the query box");
         assert!(INDEX_HTML.contains("requestAnimationFrame(draw)"), "a render loop");
+    }
+
+    /// The command center's sandbox overlay drives the live pipeline: it loads
+    /// the compiled-in presets from the binary, posts source to
+    /// `/api/live-analyze`, renders the executed program, and feeds the graph
+    /// it gets back into the same 3D scene.
+    #[test]
+    fn the_sandbox_panel_drives_the_live_pipeline() {
+        assert!(INDEX_HTML.contains("id=\"sandbox\""), "the sandbox overlay");
+        assert!(
+            INDEX_HTML.contains("/api/live-analyze/presets"),
+            "the preset manifest endpoint"
+        );
+        assert!(
+            INDEX_HTML.contains("fetch(\"/api/live-analyze\""),
+            "the live analysis endpoint"
+        );
+        assert!(INDEX_HTML.contains("id=\"code\""), "the source editor");
+        assert!(INDEX_HTML.contains("id=\"clearance\""), "the clearance selector");
+        assert!(INDEX_HTML.contains("id=\"hook\""), "the hook selector");
+        assert!(INDEX_HTML.contains("id=\"analyze\""), "the run button");
+        assert!(
+            INDEX_HTML.contains("buildScene(body.graph)"),
+            "the live DTG lands on the canvas"
+        );
+        assert!(INDEX_HTML.contains("s4.disassembly"), "the listing is rendered");
+        assert!(INDEX_HTML.contains("s4.agree"), "engine agreement is shown");
+        assert!(INDEX_HTML.contains("stage1_us"), "per-stage timings are shown");
     }
 
     /// The mobile page runs a real WebAuthn ceremony and converts the DER

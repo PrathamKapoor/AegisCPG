@@ -19,15 +19,29 @@
 //!
 //! ## HOW
 //! One quantifier-free formula over the whole DAG, negated per property, so a
-//! `sat` answer *is* the attack. The script is also written to disk verbatim so
-//! an auditor can read and re-run it by hand. The Rust solver in
+//! `sat` answer *is* the attack. Property 2, 3 and 4 clauses are generated from
+//! [`crate::verifier::enumerate_chains`] -- the *same* bounded chain enumeration
+//! the reference solver decides -- so a clause in the script and a violation in
+//! the reference report are the same fact. Every `declare-fun` symbol is pinned
+//! by exactly one `assert`, and a property with no witness clause is emitted as
+//! `false`, never as the malformed `(or)`. The script is also written to disk
+//! verbatim so an auditor can read and re-run it by hand. The Rust solver in
 //! [`crate::verifier`] must agree with Z3 whenever Z3 is present; that
-//! cross-check is asserted in the test suite.
+//! cross-check is asserted in the test suite, and `tests/algebraic_properties.rs`
+//! additionally decides the emitted script with an independent evaluator over
+//! the exact constant fragment this module emits.
+//!
+//! Property 1 (Tool Integrity) is the TACR's hash-pair comparison, decided at
+//! the gateway boundary by [`crate::verifier::tool_integrity_holds`]; a workflow
+//! graph carries no DTG hashes, so within this fragment the script states that
+//! Property 1 cannot be witnessed -- it does not re-declare some weaker
+//! substitute for it.
 //!
 //! Complexity: encoding is `O(V + E)` in the DTG sizes. Z3's own time is
 //! exponential in the worst case, which is why the hop bound and the taint
 //! pre-filter keep the formula small in practice.
 
+use crate::verifier::enumerate_chains;
 use aegis_common::tacr::CounterexampleTrace;
 use aegis_common::types::{CompressedDtg, SinkKind, MAX_HOP_DEPTH};
 use aegis_common::SecurityLattice;
@@ -143,26 +157,6 @@ impl WorkflowGraph {
             _ => false,
         }
     }
-
-    /// Every composition of length 2 or 3 that the policy currently permits.
-    ///
-    /// Bounded by [`MAX_HOP_DEPTH`]; exhaustive, so no chain is missed.
-    pub fn permitted_chains(&self) -> Vec<(String, String, String)> {
-        let mut out = Vec::new();
-        for link in &self.links {
-            out.push((link.from.clone(), link.to.clone(), link.to.clone()));
-        }
-        for first in &self.links {
-            for second in &self.links {
-                if first.to == second.from {
-                    out.push((first.from.clone(), first.to.clone(), second.to.clone()));
-                }
-            }
-        }
-        out.sort();
-        out.dedup();
-        out
-    }
 }
 
 /// Tool identifiers a DTG declares, recovered from its entry nodes.
@@ -230,6 +224,10 @@ pub fn encode(graph: &WorkflowGraph) -> String {
     let _ = writeln!(s);
 
     // --- Declaration of each tool ---
+    // Every symbol below is pinned by exactly one `assert`. Asserting both
+    // polarities (as an earlier revision did for `granted`) would make the fact
+    // set unsatisfiable, and Z3 would then answer `unsat` -- "safe" -- for every
+    // graph containing such a tool.
     let _ = writeln!(s, "; --- Tools, clearances and reached capabilities ---");
     for (id, spec) in &graph.tools {
         let _ = writeln!(s, "(declare-fun granted_{id} () Bool)");
@@ -239,15 +237,19 @@ pub fn encode(graph: &WorkflowGraph) -> String {
             "(assert (= clearance_{id} {}))",
             spec.server_clearance.level()
         );
-        let _ = writeln!(s, "(assert granted_{id})",);
-        if !spec.granted {
+        if spec.granted {
+            let _ = writeln!(s, "(assert granted_{id})");
+        } else {
             let _ = writeln!(s, "(assert (not granted_{id}))");
         }
         for kind in &spec.reaches {
             let _ = writeln!(s, "(declare-fun reaches_{id}_{kind} () Bool)");
-            let _ = writeln!(s, "(assert reaches_{id}_{kind})");
             if graph.forbidden.contains(&(id.clone(), *kind)) {
+                // The policy forbids this capability outright; the symbol
+                // records the effective capability the loader enforces.
                 let _ = writeln!(s, "(assert (not reaches_{id}_{kind}))");
+            } else {
+                let _ = writeln!(s, "(assert reaches_{id}_{kind})");
             }
         }
     }
@@ -255,13 +257,6 @@ pub fn encode(graph: &WorkflowGraph) -> String {
 
     // --- Permitted compositions ---
     let _ = writeln!(s, "; --- Permitted tool-to-tool compositions ---");
-    for link in &graph.links {
-        let _ = writeln!(
-            s,
-            "(assert (granted_{} ))",
-            link.from
-        );
-    }
     for link in &graph.links {
         let _ = writeln!(
             s,
@@ -283,73 +278,105 @@ pub fn encode(graph: &WorkflowGraph) -> String {
     // --- The four negated properties ---
     let _ = writeln!(s, "; --- Negated safety properties (sat == violated) ---");
 
-    // Property 1: every invoked tool is granted.
+    // Property 1: Tool Integrity. A workflow graph carries no DTG hashes: the
+    // approved hash is pinned in the signed TACR and compared against the
+    // freshly extracted graph at the gateway boundary
+    // (`crate::verifier::tool_integrity_holds`). Within this fragment the
+    // property therefore cannot be witnessed, and the script says so rather
+    // than substituting a weaker statement. `specs/lattice_rules.smt2` PART A
+    // carries the full hash-pair encoding for the shipped lab.
+    let _ = writeln!(
+        s,
+        "; Property 1 is decided at the TACR boundary (approved vs current"
+    );
+    let _ = writeln!(
+        s,
+        "; ast_dtg_sha256); the graph fragment carries no hash pair to compare."
+    );
     let _ = writeln!(s, "(define-fun tool_integrity_violated () Bool");
-    let _ = writeln!(s, "  (or");
-    for id in graph.tools.keys() {
-        let _ = writeln!(s, "      (not granted_{id})");
-    }
-    let _ = writeln!(s, "  ))");
+    let _ = writeln!(s, "  false)");
     let _ = writeln!(s);
 
     // Property 2: data flows to a server cleared below its level, with no
-    // hardware-approved declassification.
-    let _ = writeln!(s, "(define-fun data_confinement_violated () Bool");
-    let _ = writeln!(s, "  (or");
-    for (a, b, c) in graph.permitted_chains() {
-        let Some((level, _)) = graph.known_data.get(&a) else {
+    // hardware-approved declassification. Clauses come from the same bounded
+    // chain enumeration the reference solver decides, so clause presence is
+    // reachability and clause truth is the confinement predicate itself.
+    let mut clauses: Vec<String> = Vec::new();
+    for chain in enumerate_chains(graph) {
+        let Some((source, sink)) = chain.first().zip(chain.last()) else {
             continue;
         };
-        let Some(ctool) = graph.tools.get(&c) else {
+        let Some((level, _)) = graph.known_data.get(source) else {
             continue;
         };
-        if !level.can_flow_to(ctool.server_clearance)
-            && !graph.declassified.contains(&(a.clone(), ctool.server.clone()))
+        let Some(sink_tool) = graph.tools.get(sink) else {
+            continue;
+        };
+        if !level.can_flow_to(sink_tool.server_clearance)
+            && !graph
+                .declassified
+                .contains(&(source.clone(), sink_tool.server.clone()))
         {
-            let _ = writeln!(
-                s,
-                "      (and link_{a}_{b} link_{b}_{c} (= knows_{a} {}) \
-                 (> (clearance_{c}) 0) (not (flows_to knows_{a} (clearance_{c}))))",
-                level.level()
-            );
+            clauses.push(violation_clause(
+                &chain,
+                &[
+                    format!("(= knows_{source} {})", level.level()),
+                    format!("(not (flows_to knows_{source} clearance_{sink}))"),
+                ],
+            ));
         }
     }
-    let _ = writeln!(s, "  ))");
-    let _ = writeln!(s);
+    negated_property(&mut s, "data_confinement_violated", &clauses);
 
     // Property 3: a composition where the sink tool was never granted.
-    let _ = writeln!(s, "(define-fun privilege_boundedness_violated () Bool");
-    let _ = writeln!(s, "  (or");
+    // The violation is about privilege, not data: every link into an ungranted
+    // tool is a witness, whether or not the session holds data for the source.
+    // A link naming a sink that is not in the graph yields no clause -- the
+    // reference cannot build a trace for it, and `granted_` would be
+    // undeclared, making the script ill-formed.
+    let mut clauses: Vec<String> = Vec::new();
     for link in &graph.links {
-        if graph.tools.get(&link.to).map(|t| !t.granted).unwrap_or(true) {
-            let _ = writeln!(s, "      (and link_{}_{} (not granted_{}))", link.from, link.to, link.to);
+        if graph.tools.get(&link.to).map(|t| !t.granted).unwrap_or(false) {
+            clauses.push(format!(
+                "(and link_{}_{} (not granted_{}))",
+                link.from, link.to, link.to
+            ));
         }
     }
-    let _ = writeln!(s, "  ))");
-    let _ = writeln!(s);
+    negated_property(&mut s, "privilege_boundedness_violated", &clauses);
 
-    // Property 4: a SECRET datum reaching an unbridged, uncleared server.
-    let _ = writeln!(s, "(define-fun context_isolation_violated () Bool");
-    let _ = writeln!(s, "  (or");
-    for (a, b, c) in graph.permitted_chains() {
-        let Some((level, _)) = graph.known_data.get(&a) else {
+    // Property 4: a CONFIDENTIAL-or-higher datum reaching an unbridged,
+    // uncleared server (Cross-Server Context Bleed, TV9).
+    let mut clauses: Vec<String> = Vec::new();
+    for chain in enumerate_chains(graph) {
+        let Some((source, sink)) = chain.first().zip(chain.last()) else {
             continue;
         };
-        let Some(ctool) = graph.tools.get(&c) else {
+        let Some((level, _)) = graph.known_data.get(source) else {
             continue;
         };
+        let Some(sink_tool) = graph.tools.get(sink) else {
+            continue;
+        };
+        let source_server = graph
+            .tools
+            .get(source)
+            .map(|t| t.server.clone())
+            .unwrap_or_default();
         if level.requires_step_up_for_public()
-            && ctool.server_clearance < *level
-            && !graph.declassified.contains(&(a.clone(), ctool.server.clone()))
+            && sink_tool.server != source_server
+            && !level.can_flow_to(sink_tool.server_clearance)
+            && !graph
+                .declassified
+                .contains(&(source.clone(), sink_tool.server.clone()))
         {
-            let _ = writeln!(
-                s,
-                "      (and link_{a}_{b} link_{b}_{c} (> knows_{a} (clearance_{c})))"
-            );
+            clauses.push(violation_clause(
+                &chain,
+                &[format!("(> knows_{source} clearance_{sink})")],
+            ));
         }
     }
-    let _ = writeln!(s, "  ))");
-    let _ = writeln!(s);
+    negated_property(&mut s, "context_isolation_violated", &clauses);
 
     let _ = writeln!(s, "(define-fun any_property_violated () Bool");
     let _ = writeln!(s, "  (or tool_integrity_violated");
@@ -360,6 +387,41 @@ pub fn encode(graph: &WorkflowGraph) -> String {
     let _ = writeln!(s, "(get-value (any_property_violated))");
     let _ = writeln!(s, "(exit)");
     s
+}
+
+/// One `(define-fun <name> () Bool ...)` whose body is the disjunction of the
+/// witness clauses, or `false` when there is none.
+///
+/// Z3 rejects `(or)` with an empty argument list, so a property with no witness
+/// must be emitted as the false constant; an earlier revision emitted `(or)`
+/// and produced scripts no solver would accept for singleton or empty graphs.
+fn negated_property(s: &mut String, name: &str, clauses: &[String]) {
+    let _ = writeln!(s, "(define-fun {name} () Bool");
+    if clauses.is_empty() {
+        let _ = writeln!(s, "  false)");
+    } else {
+        let _ = writeln!(s, "  (or");
+        for clause in clauses {
+            let _ = writeln!(s, "      {clause}");
+        }
+        let _ = writeln!(s, "  ))");
+    }
+    let _ = writeln!(s);
+}
+
+/// Builds `(and link_t0_t1 ... trailing...)` for one witness chain.
+///
+/// The link conjuncts name the chain's consecutive hops -- every one a declared,
+/// asserted `link_` symbol. An earlier revision derived pair clauses from a
+/// `(from, to, to)` shorthand and emitted an undeclared `link_b_b`, which Z3
+/// rejects outright.
+fn violation_clause(chain: &[String], trailing: &[String]) -> String {
+    let mut conjuncts: Vec<String> = chain
+        .windows(2)
+        .map(|hop| format!("link_{}_{}", hop[0], hop[1]))
+        .collect();
+    conjuncts.extend(trailing.iter().cloned());
+    format!("(and {})", conjuncts.join(" "))
 }
 
 /// The outcome of consulting an external Z3 binary.
@@ -413,6 +475,15 @@ pub fn run_z3(script: &str) -> Z3Outcome {
 }
 
 /// Builds a counterexample trace from a detected violation.
+///
+/// A Property 3 composition may name a source tool the session holds no data
+/// for yet: the violation is about privilege, not about data, so the trace
+/// then uses the minimal lattice level. The witness is that even the most
+/// public datum cannot be moved into a tool the agent was never granted.
+/// Returning `None` is reserved for chains that cannot exist in the graph: an
+/// empty chain or an unknown sink tool. An earlier revision returned `None`
+/// whenever the source had no known data, which silently dropped every
+/// Property 3 violation whose composition did not involve session data.
 pub fn trace_for(
     property: &str,
     graph: &WorkflowGraph,
@@ -423,7 +494,11 @@ pub fn trace_for(
     }
     let source = &chain[0];
     let sink = chain.last()?;
-    let (level, _) = graph.known_data.get(source)?;
+    let level = graph
+        .known_data
+        .get(source)
+        .map(|(level, _)| *level)
+        .unwrap_or_else(SecurityLattice::bottom);
     let sink_tool = graph.tools.get(sink)?;
 
     let mut witness_steps = vec![aegis_common::tacr::TransitionStep {
@@ -459,7 +534,7 @@ pub fn trace_for(
         violated_property: property.to_string(),
         source_tool: source.clone(),
         sink_tool: sink.clone(),
-        source_lattice: *level,
+        source_lattice: level,
         target_clearance: sink_tool.server_clearance,
         witness_steps,
         solve_time_ms: 0.0,

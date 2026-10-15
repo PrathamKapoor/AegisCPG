@@ -45,8 +45,9 @@ pub mod ringbuf_reader;
 pub mod toolchain;
 
 pub use policy_compiler::{
-    cidr_contains, compile, normalise_path, CgroupPolicyEntry, CompileError, HookType,
-    KernelEvent, KernelLsmSimulator, LpmPrefix, PolicySet, Verdict,
+    cidr_contains, compile, exact_destination, maps_for_policy, normalise_path, CgroupPolicyEntry,
+    CompileError, HookType, KernelEvent, KernelLsmSimulator, LpmPrefix, PolicySet, Verdict,
+    LPM_PATH_BYTES, MAP_CGROUP_POLICY, MAP_EXEC_REGISTRY, MAP_NET_DESTINATIONS, MAP_PATH_TRIE,
 };
 pub use ringbuf_reader::{
     decode, encode, DecodeError, TelemetryBuffer, EVENT_SIZE_BYTES,

@@ -221,7 +221,13 @@ pub fn verify(graph: &WorkflowGraph) -> VerificationReport {
 ///
 /// Exhaustive by construction: the hop bound is the same bound the DTG used, so
 /// anything the static stage could have found is reachable here.
-fn enumerate_chains(graph: &WorkflowGraph) -> Vec<Vec<String>> {
+///
+/// The SMT encoder generates its Property 2/3/4 clauses from *this* enumeration
+/// (see [`crate::smt_encoder::encode`]), so a clause in the script and a
+/// violation in a [`VerificationReport`] are the same fact -- which is what makes
+/// the Z3 cross-check meaningful rather than a comparison of two different
+/// approximations. The visibility is `pub(crate)` for exactly that reuse.
+pub(crate) fn enumerate_chains(graph: &WorkflowGraph) -> Vec<Vec<String>> {
     let mut out: Vec<Vec<String>> = Vec::new();
 
     for source in graph.known_data.keys() {
@@ -547,15 +553,6 @@ use crate::smt_encoder::ToolSpec;
             t.server_clearance = SecurityLattice::Secret;
         }
         assert!(verify(&g).is_safe());
-    }
-
-    #[test]
-    fn permitted_chains_include_the_hop_limited_ones() {
-        let g = exfil_graph();
-        let chains = g.permitted_chains();
-        assert!(chains.iter().any(|(a, b, c)| a == "fs.read_env"
-            && b == "md.format"
-            && c == "slack.post"));
     }
 
     #[test]

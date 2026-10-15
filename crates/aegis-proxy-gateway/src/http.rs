@@ -62,6 +62,7 @@ use crate::edit_automaton::{
     error_codes, next_state, sanitise_tool_result, strip_injection_payloads, EditState,
     EnforcementAction, JsonRpcMessage, McpAction,
 };
+use crate::live_analyze::{self, LiveAnalyzeRequest};
 use crate::metrics::{Gauges, Metrics, MetricsResponse};
 use crate::oauth::{AuthorizeRequest, OauthClient, OauthServer, TokenRequest};
 use crate::paseto::PasetoIssuer;
@@ -1341,6 +1342,56 @@ pub async fn handle_graph(
         .into_response()
 }
 
+/// The response to `GET /api/live-analyze/presets`.
+#[derive(Debug, Clone, Serialize)]
+pub struct LivePresetsResponse {
+    /// The compiled-in examples, each pinned by a test against its declared
+    /// outcome.
+    pub presets: &'static [live_analyze::LivePreset],
+}
+
+/// `GET /api/live-analyze/presets` -- the one-click examples the sandbox panel
+/// loads. Served from the binary, not the page, so the examples cannot drift
+/// from the pipeline they demonstrate.
+pub async fn handle_live_presets() -> Json<LivePresetsResponse> {
+    Json(LivePresetsResponse {
+        presets: live_analyze::presets(),
+    })
+}
+
+/// `POST /api/live-analyze` -- the live code-to-eBPF sandbox.
+///
+/// Runs all four stages synchronously over the posted source and answers with
+/// the DTG, the divergence signals, the verification report, the signed TACR,
+/// a PASETO token, and the executed decision program's disassembly. A rejected
+/// request is a 400 carrying the fix, never a partial analysis.
+pub async fn handle_live_analyze(
+    State(state): State<Arc<GatewayState>>,
+    Json(request): Json<LiveAnalyzeRequest>,
+) -> Response {
+    match live_analyze::analyze(&request, &state.paseto, state.now()) {
+        Ok(response) => {
+            state.emit(
+                "live_analyze",
+                None,
+                serde_json::json!({
+                    "server_id": response.server_id,
+                    "language": response.language,
+                    "dtg_sha256": response.stage1.dtg_sha256,
+                    "verdict": response.stage2.verdict,
+                    "safe": response.stage3.safe,
+                    "hook": response.stage4.hook,
+                    "kernel": response.stage4.vm_verdict,
+                    "agree": response.stage4.agree,
+                    "total_us": response.timings.total_us,
+                }),
+            );
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Err(error) => error_response(StatusCode::BAD_REQUEST, error.to_string()),
+    }
+}
+
 /// The body of `POST /api/cypher/query`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CypherRequest {
@@ -1555,6 +1606,10 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/api/servers", get(handle_servers))
         .route("/api/graph/:server_id", get(handle_graph))
         .route("/api/cypher/query", post(handle_cypher))
+        // The live code-to-eBPF sandbox (Phase 9): the same four stages the
+        // offline pipeline runs, over source posted at request time.
+        .route("/api/live-analyze", post(handle_live_analyze))
+        .route("/api/live-analyze/presets", get(handle_live_presets))
         .route("/api/metrics", get(handle_metrics_json))
         .route("/api/events", get(handle_events))
         .route("/metrics", get(handle_metrics_prometheus))

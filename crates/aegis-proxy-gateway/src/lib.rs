@@ -45,6 +45,7 @@ pub mod cypher;
 pub mod edit_automaton;
 pub mod grpc_bridge;
 pub mod http;
+pub mod live_analyze;
 pub mod metrics;
 pub mod oauth;
 pub mod paseto;

@@ -366,7 +366,7 @@ def gate_rust_tests() -> Gate:
     passed = sum(int(m) for m in re.findall(r"test result: ok\. (\d+) passed", output))
     failed = sum(int(m) for m in re.findall(r"(\d+) failed", output))
     gate.require(completed.returncode == 0, f"cargo test exited {completed.returncode}")
-    gate.require(passed >= 400, f"only {passed} Rust tests ran; expected at least 400")
+    gate.require(passed >= 430, f"only {passed} Rust tests ran; expected at least 430")
     gate.require(failed == 0, f"{failed} Rust tests failed")
     gate.require(
         "warning:" not in output,
@@ -633,6 +633,124 @@ def gate_tree_clean() -> Gate:
     return gate
 
 
+def gate_live_sandbox_and_fuzz() -> Gate:
+    """Phase 9: the live sandbox, the differential fuzzer and their artefacts.
+
+    Three claims, each checked against the shipped thing rather than a
+    description of it. The walkthrough runner drives the real binaries end to
+    end -- including the gateway's live code-to-eBPF sandbox over loopback HTTP
+    -- and must exit zero inside its ten-second budget. The two sealed test
+    artefacts (the 1,000-case three-way differential fuzz and the
+    algebraic-properties guard agreement) must carry their pinned identities.
+    And the committed benchmark outputs must show all of it: eight DuckDB
+    tables, five Parquet files, and the fuzz and algebraic blocks in the
+    summary.
+    """
+    gate = Gate("Phase 9 live sandbox and fuzz artefacts")
+    completed = run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(CARGO_WRAPPER),
+            "build",
+            "--package",
+            "aegis-cli",
+            "--package",
+            "aegis-proxy-gateway",
+        ],
+        timeout=3600,
+    )
+    gate.require(completed.returncode == 0, f"cargo build exited {completed.returncode}")
+
+    demo = run([str(PYTHON), "scripts/demo_walkthrough.py", "--smoke"], timeout=600)
+    gate.require(
+        demo.returncode == 0,
+        f"the walkthrough exited {demo.returncode}: "
+        f"{(demo.stderr or demo.stdout).strip()[-400:]}",
+    )
+
+    fuzz_path = REPO_ROOT / "target" / "differential-fuzz" / "fuzz_summary.json"
+    gate.require(fuzz_path.exists(), "no differential-fuzz artefact was produced")
+    if fuzz_path.exists():
+        fuzz = json.loads(fuzz_path.read_text(encoding="utf-8"))
+        gate.require(fuzz["seed"] == "0xae615c9620260008", f"fuzz seed {fuzz['seed']}")
+        gate.require(fuzz["cases"] == 1000, f"the fuzz ran {fuzz['cases']} cases")
+        gate.require(
+            fuzz["three_way_equal"], "the three-way fuzz equality did not hold"
+        )
+        gate.require(
+            fuzz["allows"] + fuzz["denials"] == fuzz["probes"],
+            "the fuzz verdict counts do not sum to the probe count",
+        )
+        gate.require(
+            fuzz["mutant_control_divergences"] > 0,
+            "the fuzz mutant control caught nothing",
+        )
+
+    algebra_path = REPO_ROOT / "target" / "algebraic-properties" / "summary.json"
+    gate.require(algebra_path.exists(), "no algebraic-properties artefact was produced")
+    if algebra_path.exists():
+        algebra = json.loads(algebra_path.read_text(encoding="utf-8"))
+        inputs = algebra["inputs"]
+        guard = algebra["property_c"]
+        gate.require(
+            inputs["dtg_hash_cases"] == 200
+            and inputs["lattice_triples"] == 64
+            and inputs["tuple_cases"] == 200,
+            f"the algebraic inputs drifted: {inputs}",
+        )
+        gate.require(
+            guard["three_way_agreements"] == 200 and guard["facts_consistent"],
+            "the guard agreement did not hold on every tuple",
+        )
+
+    summary_path = REPO_ROOT / "benchmarks" / "results" / "summary_metrics.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    gate.require(
+        summary["fuzz"]["three_way_equal"] and summary["fuzz"]["cases"] == 1000,
+        "the summary's fuzz block drifted",
+    )
+    gate.require(
+        summary["algebraic"]["three_way_agreements"] == 200
+        and summary["algebraic"]["facts_consistent"],
+        "the summary's algebraic block drifted",
+    )
+
+    results = REPO_ROOT / "benchmarks" / "results"
+    for name in (
+        "aegis_benchmarks.parquet",
+        "aegis_tla_checks.parquet",
+        "aegis_ebpf_equivalence.parquet",
+        "aegis_differential_fuzz.parquet",
+        "aegis_algebraic_properties.parquet",
+    ):
+        path = results / name
+        gate.require(path.exists() and path.stat().st_size > 0, f"missing {name}")
+
+    tables = run(
+        [
+            str(PYTHON),
+            "-c",
+            "import duckdb;"
+            "c=duckdb.connect(r'benchmarks/results/aegis_benchmarks.duckdb',read_only=True);"
+            "print(len(c.execute('SHOW TABLES').fetchall()))",
+        ],
+        timeout=300,
+    )
+    gate.require(tables.returncode == 0, "the DuckDB output is not readable")
+    count = tables.stdout.strip()
+    gate.require(count == "8", f"the DuckDB carries {count} tables, expected 8")
+    print(
+        "        walkthrough 6/6 acts; fuzz 1000 cases three-way equal; "
+        "8 tables, 5 Parquet files",
+        flush=True,
+    )
+    return gate
+
+
 GATES = (
     gate_containment,
     gate_authorship,
@@ -646,6 +764,7 @@ GATES = (
     gate_service_binaries,
     gate_benchmarks,
     gate_deployment,
+    gate_live_sandbox_and_fuzz,
     gate_tree_clean,
 )
 

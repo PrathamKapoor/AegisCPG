@@ -33,6 +33,16 @@
  *           kernel32.lib /out:aegis-shim.exe
  *   On Linux/macOS: cc -O1 -Wall -Werror aegis_userspace_shim.c -o aegis-shim
  *
+ *   Compiled with -DAEGIS_SHIM_BATCH it additionally reads a command script
+ *   from stdin after the fixture report and prints one BATCH line per probe,
+ *   which is how the 1,000-case differential fuzzer drives it in one process:
+ *     RESET                                -- clears the four maps and the ring
+ *     POLICY <cg> <allow> <deny> <level> <mode>  -- a repeat replaces, like the map
+ *     LPM <bits> <allow> <cg> <path>       -- bits defaults to len*8 in fixture
+ *     NET <cg> <addr> / EXEC <cg> <ino> <sha>
+ *     BPRM <cg> <ino> <sha> | FILE <cg> <flags> <path> | SOCKET <cg> <family> <addr>
+ *     DONE
+ *
  *   Output grammar (parsed by the Rust equivalence test):
  *     SHIM <name> <version>
  *     MAP policy <cg> <allow> <deny> <level> <mode>
@@ -42,6 +52,10 @@
  *     CASE <n> bprm cg=.. ino=.. sha=.. -> allow|deny
  *     CASE <n> file_open cg=.. flags=.. path=.. -> allow|deny
  *     CASE <n> socket cg=.. family=.. addr=.. -> allow|deny
+ *     BATCH <n> bprm cg=.. ino=.. sha=.. verdict=allow|deny          (batch build)
+ *     BATCH <n> file_open cg=.. flags=.. path=.. verdict=allow|deny  (batch build)
+ *     BATCH <n> socket cg=.. family=.. addr=.. verdict=allow|deny    (batch build)
+ *     BATCH-ERROR <reason>                 -- script refused; exits 2, fail closed
  *     EVENT <hook> <verdict> <cg> <target-or-dash>
  *     SELFTEST ok | SELFTEST failed <n>
  */
@@ -52,14 +66,20 @@
 #ifdef _WIN32
 /*
  * Freestanding Windows build: no CRT, so stdio is not available and the
- * process talks to the OS through three kernel32 imports. The import library
- * is generated from a two-line .def by llvm-dlltool (see the Rust test);
- * nothing else is linked.
+ * process talks to the OS through three kernel32 imports -- five in the
+ * batch build, which also reads its command script from stdin and reports
+ * the Win32 error code when a read fails. The import library is generated
+ * from a .def by llvm-dlltool (see the Rust test); nothing else is linked.
  */
 __declspec(dllimport) void *__stdcall GetStdHandle(unsigned long);
 __declspec(dllimport) int __stdcall WriteFile(void *, const char *, unsigned long,
                                              unsigned long *, void *);
 __declspec(dllimport) void __stdcall ExitProcess(unsigned long);
+#ifdef AEGIS_SHIM_BATCH
+__declspec(dllimport) int __stdcall ReadFile(void *, char *, unsigned long,
+                                            unsigned long *, void *);
+__declspec(dllimport) unsigned long __stdcall GetLastError(void);
+#endif
 
 static void flush_out(void);
 static void exit_now(unsigned long code);
@@ -430,26 +450,62 @@ void bpf_ringbuf_submit(void *data, __u64 flags)
 /* Fixture builders                                                    */
 /* ------------------------------------------------------------------ */
 
-static void policy_put(__u64 cg, __u32 allow, __u32 deny, __u32 level, __u32 mode)
+/*
+ * Installs a cgroup policy and returns 0, or -1 when a *new* cgroup would
+ * exceed the table (a replacement never needs a new slot).
+ *
+ * The kernel's policy map is a hash map: a second update for the same cgroup
+ * replaces the stored policy, and both the simulator and the VM model that.
+ * The fixture builder never repeats a cgroup; a batch script may, and the
+ * differential fuzzer does, so this writes like the map -- in place for a
+ * known cgroup, appended for a new one -- rather than shadowing the first row
+ * with an unreachable later one.
+ */
+static int policy_put(__u64 cg, __u32 allow, __u32 deny, __u32 level, __u32 mode)
 {
-    g_cgroups[g_n_cgroups].cg = cg;
-    g_cgroups[g_n_cgroups].pol.allow_bitmask = allow;
-    g_cgroups[g_n_cgroups].pol.deny_bitmask = deny;
-    g_cgroups[g_n_cgroups].pol.max_lattice_level = level;
-    g_cgroups[g_n_cgroups].pol.enforce_mode = mode;
-    g_n_cgroups++;
+    int slot = -1;
+    int i;
+    for (i = 0; i < g_n_cgroups; i++) {
+        if (g_cgroups[i].cg == cg) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        if (g_n_cgroups >= MAX_CGROUPS)
+            return -1;
+        slot = g_n_cgroups;
+        g_cgroups[slot].cg = cg;
+        g_n_cgroups++;
+    }
+    g_cgroups[slot].pol.allow_bitmask = allow;
+    g_cgroups[slot].pol.deny_bitmask = deny;
+    g_cgroups[slot].pol.max_lattice_level = level;
+    g_cgroups[slot].pol.enforce_mode = mode;
+    return 0;
 }
 
-static void lpm_put(const char *path, __u32 allow, __u32 value_cg)
+static void lpm_put_bits(const char *path, __u32 bits, __u32 allow, __u32 value_cg)
 {
+    /*
+     * Precondition, checked by the batch parser before this is called: the
+     * path fits AEGIS_TARGET_LEN bytes and `bits <= strlen(path) * 8`. The
+     * fixture builder satisfies it by construction, and a batch script that
+     * violates it is refused rather than silently truncated.
+     */
     unsigned long len = str_len(path);
     unsigned long i;
-    g_lpm[g_n_lpm].prefix_len = (__u32)(len * 8);
+    g_lpm[g_n_lpm].prefix_len = bits;
     g_lpm[g_n_lpm].allow = allow;
     g_lpm[g_n_lpm].value_cg = value_cg;
     for (i = 0; i < len; i++)
         g_lpm[g_n_lpm].bytes[i] = (__u8)path[i];
     g_n_lpm++;
+}
+
+static void lpm_put(const char *path, __u32 allow, __u32 value_cg)
+{
+    lpm_put_bits(path, (__u32)(str_len(path) * 8), allow, value_cg);
 }
 
 static void net_put(__u64 cg, __u32 addr)
@@ -745,6 +801,369 @@ static void run_cases(void)
     run_socket_case(9999, 2, 0x090071CB, 0, "no-policy");
 }
 
+/* ------------------------------------------------------------------ */
+/* Batch mode: the differential fuzzer's driver                        */
+/* ------------------------------------------------------------------ */
+
+#ifdef AEGIS_SHIM_BATCH
+
+#define BATCH_INPUT_BYTES (1024u * 1024u)
+#define BATCH_FLUSH_AT 16384u
+
+static char g_in[BATCH_INPUT_BYTES + 1];
+static int g_batch_case;
+
+static void batch_error(const char *reason)
+{
+    out_str("BATCH-ERROR ");
+    out_str(reason);
+    out_ch('\n');
+    exit_now(2);
+}
+
+/*
+ * Reads all of stdin into g_in. The buffer is one byte larger than the cap so
+ * an oversized script is *detected* rather than truncated: a driver that
+ * parsed a prefix of its input would be comparing different case sets.
+ *
+ * On Windows an anonymous pipe signals end-of-input differently from a file
+ * redirect: the read that finds the writer gone and nothing buffered fails
+ * with ERROR_BROKEN_PIPE (109) instead of succeeding with zero bytes. Both
+ * mean the script is complete, so 109 is treated as EOF -- and any *other*
+ * read failure is refused with the Win32 code, fail closed. A script that was
+ * actually truncated is caught downstream by the driver, which knows how many
+ * probes it wrote and requires exactly that many verdicts back.
+ */
+static void batch_read_stdin(void)
+{
+    unsigned long total = 0;
+    while (total <= BATCH_INPUT_BYTES) {
+        unsigned long got = 0;
+        unsigned long want = (BATCH_INPUT_BYTES + 1) - total;
+#ifdef _WIN32
+        void *h = GetStdHandle(0xFFFFFFF6u); /* (DWORD)-10 == STD_INPUT_HANDLE */
+        if (!ReadFile(h, g_in + total, want, &got, 0)) {
+            unsigned long error = GetLastError();
+            if (error != 109u) { /* 109 == ERROR_BROKEN_PIPE == pipe EOF */
+                out_str("BATCH-ERROR stdin-read win32=");
+                out_u64(error);
+                out_ch('\n');
+                exit_now(2);
+            }
+            g_in[total] = '\0';
+            return;
+        }
+#else
+        long n = read(0, g_in + total, want);
+        if (n < 0) {
+            out_str("BATCH-ERROR stdin-read\n");
+            exit_now(2);
+        }
+        got = (unsigned long)n;
+#endif
+        if (got == 0) {
+            g_in[total] = '\0';
+            return;
+        }
+        total += got;
+    }
+    batch_error("input-too-large");
+}
+
+static int is_blank(char c)
+{
+    return c == ' ' || c == '\t' || c == '\r';
+}
+
+/* Skips blanks; returns the first significant character (0 at line end). */
+static char skip_blanks(char **p)
+{
+    while (is_blank(**p))
+        (*p)++;
+    return **p;
+}
+
+/* Consumes `word` when the next token is exactly it. */
+static int word_is(char **p, const char *word)
+{
+    char *s = *p;
+    while (*word) {
+        if (*s++ != *word++)
+            return 0;
+    }
+    if (*s && !is_blank(*s))
+        return 0;
+    *p = s;
+    return 1;
+}
+
+static unsigned long long batch_u64(char **p)
+{
+    unsigned long long v = 0;
+    char c = skip_blanks(p);
+    if (c < '0' || c > '9')
+        batch_error("expected-number");
+    while (**p >= '0' && **p <= '9') {
+        v = v * 10u + (unsigned long long)(**p - '0');
+        (*p)++;
+    }
+    return v;
+}
+
+/*
+ * The next token, NUL-terminated in place. Paths and digests are matched
+ * byte-for-byte by the trie and the digest table, so they travel as raw
+ * bytes and never through anything that could fold or normalise them.
+ */
+static char *batch_token(char **p)
+{
+    char *s;
+    skip_blanks(p);
+    s = *p;
+    while (**p && !is_blank(**p))
+        (*p)++;
+    if (**p)
+        *(*p)++ = '\0';
+    return s;
+}
+
+/*
+ * Every batch probe must produce exactly one event, carrying its own hook,
+ * verdict, cgroup, and the harness task name. Anything else is a failure the
+ * driver reports through the same MISMATCH/SELFTEST channel the 24-case
+ * table uses.
+ */
+static void batch_verify_event(int v, __u64 cg, __u32 hook, int first_ev)
+{
+    int produced = g_n_events - first_ev;
+    if (produced != 1) {
+        fail(produced == 0 ? "batch-event-missing" : "batch-event-count");
+        return;
+    }
+    {
+        struct aegis_kernel_event *e = &g_events[first_ev];
+        if (e->hook_type != hook)
+            fail("batch-event-hook");
+        if (e->verdict != v)
+            fail("batch-event-verdict");
+        if (e->cgroup_id != cg)
+            fail("batch-event-cgroup");
+        if (e->comm[0] != 'a')
+            fail("batch-event-comm");
+    }
+}
+
+/* Keeps the 32 KiB report buffer from ever silently dropping a line. */
+static void batch_flush(void)
+{
+    if (out_len >= BATCH_FLUSH_AT)
+        flush_out();
+}
+
+static void batch_bprm(__u64 cg, __u64 ino, const char *sha)
+{
+    struct file f;
+    struct aegis_shim_inode inode;
+    struct linux_binprm bprm;
+    int first_ev = g_n_events;
+    int v;
+
+    g_batch_case++;
+    g_cgroup = cg;
+    inode.i_ino = ino;
+    f.f_path.path = "exec";
+    f.f_flags = 0;
+    f.f_inode = &inode;
+    bprm.file = &f;
+
+    v = aegis_bprm_check_security(&bprm);
+
+    out_str("BATCH ");
+    out_u64((unsigned long long)g_batch_case);
+    out_str(" bprm cg=");
+    out_u64(cg);
+    out_str(" ino=");
+    out_u64(ino);
+    out_str(" sha=");
+    out_str(sha);
+    out_str(" verdict=");
+    out_str(v == 0 ? "allow" : "deny");
+    out_ch('\n');
+
+    batch_verify_event(v, cg, AEGIS_HOOK_BPRM, first_ev);
+    batch_flush();
+}
+
+static void batch_file(__u64 cg, unsigned int flags, const char *path)
+{
+    struct file f;
+    struct aegis_shim_inode inode;
+    int first_ev = g_n_events;
+    int v;
+
+    g_batch_case++;
+    g_cgroup = cg;
+    inode.i_ino = 777;
+    f.f_path.path = path;
+    f.f_flags = flags;
+    f.f_inode = &inode;
+
+    v = aegis_file_open(&f);
+
+    out_str("BATCH ");
+    out_u64((unsigned long long)g_batch_case);
+    out_str(" file_open cg=");
+    out_u64(cg);
+    out_str(" flags=");
+    out_u64(flags);
+    out_str(" path=");
+    out_str(path);
+    out_str(" verdict=");
+    out_str(v == 0 ? "allow" : "deny");
+    out_ch('\n');
+
+    batch_verify_event(v, cg, AEGIS_HOOK_FILE_OPEN, first_ev);
+    batch_flush();
+}
+
+static void batch_socket(__u64 cg, unsigned int family, __u32 addr)
+{
+    struct sockaddr_in sin;
+    int first_ev = g_n_events;
+    int v;
+
+    g_batch_case++;
+    g_cgroup = cg;
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = (unsigned short)family;
+    sin.sin_addr.s_addr = addr;
+
+    v = aegis_socket_connect(NULL, (struct sockaddr *)&sin, 16);
+
+    out_str("BATCH ");
+    out_u64((unsigned long long)g_batch_case);
+    out_str(" socket cg=");
+    out_u64(cg);
+    out_str(" family=");
+    out_u64(family);
+    out_str(" addr=");
+    out_u64(addr);
+    out_str(" verdict=");
+    out_str(v == 0 ? "allow" : "deny");
+    out_ch('\n');
+
+    batch_verify_event(v, cg, AEGIS_HOOK_SOCKET_CONNECT, first_ev);
+    batch_flush();
+}
+
+static void batch_command(char *line)
+{
+    char *p = line;
+    if (!skip_blanks(&p))
+        return;
+
+    if (word_is(&p, "RESET")) {
+        g_n_cgroups = 0;
+        g_n_lpm = 0;
+        g_n_net = 0;
+        g_n_exec = 0;
+        g_n_events = 0;
+        g_cgroup = 0;
+        return;
+    }
+    if (word_is(&p, "POLICY")) {
+        __u64 cg = batch_u64(&p);
+        __u32 allow = (__u32)batch_u64(&p);
+        __u32 deny = (__u32)batch_u64(&p);
+        __u32 level = (__u32)batch_u64(&p);
+        __u32 mode = (__u32)batch_u64(&p);
+        if (policy_put(cg, allow, deny, level, mode) != 0)
+            batch_error("policy-overflow");
+        return;
+    }
+    if (word_is(&p, "LPM")) {
+        __u32 bits = (__u32)batch_u64(&p);
+        __u32 allow = (__u32)batch_u64(&p);
+        __u32 cg = (__u32)batch_u64(&p);
+        char *path = batch_token(&p);
+        if (g_n_lpm >= MAX_LPM)
+            batch_error("lpm-overflow");
+        if (str_len(path) >= AEGIS_TARGET_LEN || bits > str_len(path) * 8)
+            batch_error("lpm-key");
+        lpm_put_bits(path, bits, allow, cg);
+        return;
+    }
+    if (word_is(&p, "NET")) {
+        __u64 cg = batch_u64(&p);
+        __u32 addr = (__u32)batch_u64(&p);
+        if (g_n_net >= MAX_NET)
+            batch_error("net-overflow");
+        net_put(cg, addr);
+        return;
+    }
+    if (word_is(&p, "EXEC")) {
+        __u64 cg = batch_u64(&p);
+        __u64 ino = batch_u64(&p);
+        char *sha = batch_token(&p);
+        if (g_n_exec >= MAX_EXEC)
+            batch_error("exec-overflow");
+        exec_put(cg, ino, sha);
+        return;
+    }
+    if (word_is(&p, "BPRM")) {
+        __u64 cg = batch_u64(&p);
+        __u64 ino = batch_u64(&p);
+        char *sha = batch_token(&p);
+        batch_bprm(cg, ino, sha);
+        return;
+    }
+    if (word_is(&p, "FILE")) {
+        __u64 cg = batch_u64(&p);
+        unsigned int flags = (unsigned int)batch_u64(&p);
+        char *path = batch_token(&p);
+        batch_file(cg, flags, path);
+        return;
+    }
+    if (word_is(&p, "SOCKET")) {
+        __u64 cg = batch_u64(&p);
+        unsigned int family = (unsigned int)batch_u64(&p);
+        __u32 addr = (__u32)batch_u64(&p);
+        batch_socket(cg, family, addr);
+        return;
+    }
+    if (word_is(&p, "DONE"))
+        return;
+
+    batch_error("unknown-command");
+}
+
+static void run_batch(void)
+{
+    char *p;
+
+    batch_read_stdin();
+    /*
+     * The batch owns the audit ring from here on: the clean report above is
+     * already complete in the output buffer, and the driver resets between
+     * cases, but a script that forgot to would otherwise fill all 64 slots.
+     */
+    g_n_events = 0;
+
+    p = g_in;
+    while (*p) {
+        char *line = p;
+        while (*p && *p != '\n')
+            p++;
+        if (*p == '\n') {
+            *p = '\0';
+            p++;
+        }
+        batch_command(line);
+    }
+}
+
+#endif /* AEGIS_SHIM_BATCH */
+
 AEGIS_ENTRY
 {
     build_fixture();
@@ -752,6 +1171,9 @@ AEGIS_ENTRY
     out_str("SHIM aegis-ebpf-userspace 1\n");
     print_maps();
     run_cases();
+#ifdef AEGIS_SHIM_BATCH
+    run_batch();
+#endif
 
     if (g_failures == 0) {
         out_str("SELFTEST ok\n");

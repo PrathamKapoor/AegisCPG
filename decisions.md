@@ -1620,3 +1620,101 @@ issuer with a deterministic fallback key is a vulnerability, not a convenience.
 * The PASETO module is tested against every confusion class it exists to make
   impossible: tampered payload, tampered signature, wrong version header,
   expired `exp`, wrong `aud`, wrong `iss`.
+
+## ADR-023 - Live sandbox, differential fuzzing, and algebraic guard agreement for the verifier (Phase 9)
+
+**Status.** Accepted
+**Date.** 2026-10-16
+
+### Context
+
+Phase 8 closed with the control plane green and thirteen audit gates passing,
+but three claims had no evidence behind them:
+
+1. The SMT encoder and the reference decision procedure were only ever
+   cross-checked *through Z3*, and there is no solver binary on this host. The
+   encode-versus-verify agreement was asserted by tests that constructed the
+   graphs the encoder already handled, so an encoder defect that turned a
+   violation into `unsat` would have been invisible -- a silent "safe".
+2. The three eBPF readers (the freestanding C hooks, the Rust simulator, the
+   RFC 9669 VM) agreed on the 24-case table, but 24 hand-written cases cannot
+   pin the space of policy combinations.
+3. A judge could not *see* the pipeline run. Every claim lived in test output
+   and committed artefacts, and nothing drove source -> extract -> verify ->
+   compile -> disassemble -> kernel verdict on the real binaries.
+
+### Decision
+
+1. **A live sandbox, served by the gateway on loopback.**
+   `GET /api/live-analyze/presets` publishes five compiled-in presets (four
+   malicious, one clean) and `POST /api/live-analyze` runs the whole chain over
+   submitted source: Stage 1 extraction, the divergence signals, the SMT
+   verification, TACR synthesis, BPF compilation, the disassembly, and the
+   verdict from both the reference simulator and the RFC 9669 VM. The portal
+   serves the panel at `GET /`; the gateway binds loopback only and refuses
+   anything else.
+2. **A seeded three-way differential fuzzer.** `tests/differential_fuzz.rs`
+   generates 1,000 policy cases (14,000 probes) and requires verdict equality
+   across all three implementations on every probe. A seeded mutant corpus
+   (900 injected divergences) must be *detected*, so equality is evidence
+   rather than silence.
+3. **Algebraic guard agreement over the emitted script.**
+   `tests/algebraic_properties.rs` pins Property A (200 hash-determinism cases
+   with sink-argument sensitivity), Property B (the exhaustive 4^3 lattice
+   laws) and Property C (200 randomized composition tuples decided three ways:
+   the TLA+ operators of `specs/CompositionGuard.tla`, the reference verifier,
+   and a decision procedure over the emitted SMT-LIB text itself, pinning every
+   fact symbol to exactly one polarity and failing closed outside the decidable
+   fragment). This is what replaced the Z3-dependent cross-check on hosts
+   without a solver.
+4. **A six-act walkthrough runner** (`scripts/demo_walkthrough.py`) drives the
+   real binaries end to end inside a ten-second budget and fails closed on
+   missing artefacts; `--smoke` reports them as skipped instead. Its output is
+   the stage script in `docs/JUDGE_DEFENSE_AND_DEMO.md`.
+5. **The benchmark harness ingests the two sealed artefacts** (eight DuckDB
+   tables, five Parquet files, the fuzz and algebraic blocks in
+   `summary_metrics.json`), and Gate 14 (`gate_live_sandbox_and_fuzz`)
+   re-asserts the pinned identities and runs the walkthrough in smoke mode.
+
+### What the property suite found
+
+Property C was written to keep the three readings from drifting apart; its
+first randomized run found ten real defects -- nine in the encoder and one in
+the reference verifier -- each producing a plausible wrong answer rather than
+an error: a clearance guard that excused every PUBLIC-sink downgrade; pair
+clauses built from a `(a,b,b)` shorthand that emitted an undeclared symbol;
+both polarities of the same fact; Property 1 conflated with authorization; a
+Property 4 missing its cross-server requirement; depth-1 chains never checked;
+forbidden capabilities asserted both ways; an empty disjunction; parenthesised
+0-ary symbols; and -- the reference-side defect -- Property 3 violations
+silently dropped when the composition's source tool had no session data.
+Every repair is pinned by a test that fails on the old code; the ledger is
+`docs/JUDGE_DEFENSE_AND_DEMO.md` section 3.
+
+### Why not...
+
+* **Why not run Z3?** No solver binary is on this host and the registry is
+  unreachable (ADR-001's air-gap). The script remains the artefact; on a host
+  with Z3, `run_z3` executes it. The decision procedure over the emitted text
+  is the evidence here, and it is stricter than "the solver said unsat": it
+  also checks the fact set for contradictions before deciding.
+* **Why not fuzz with a general-purpose fuzzer?** The question is not "does
+  the code crash" but "do the three implementations agree". A corpus generator
+  that emits policy documents and checks verdict triples *is* the test, and the
+  mutant control makes its silence meaningful.
+* **Why not make the sandbox a separate binary?** The gateway already owns the
+  pipeline and the portal; a second binary would be a second place for the
+  presets to drift. The presets are compiled into the binary and served by it,
+  so the page cannot show a stale example.
+
+### Consequences
+
+* The Rust test floor rises to 430 (435 measured); the audit carries 14 gates.
+* `docs/JUDGE_DEFENSE_AND_DEMO.md` holds the three-minute stage script, the
+  ten-defect ledger and the ten toughest judge questions.
+* `flow.md` gains Flow 8 (the live sandbox); the README's measured-results
+  table gains the fuzz and guard-agreement rows.
+* The fuzzer's ~2-minute runtime means the benchmark harness ingests its sealed
+  summary rather than re-running it; the artefact is regenerated by
+  `cargo test -p aegis-ebpf-loader --test differential_fuzz`, which the audit's
+  Rust-test gate runs before the benchmark and sandbox gates read it.

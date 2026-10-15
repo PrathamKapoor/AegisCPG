@@ -29,7 +29,9 @@ Measured on **Windows 11 on ARM64 (Qualcomm Snapdragon, `ARM64`)**, Python
 3.12.10, rustc 1.99.0, against the 14 shipped fixtures and 51 compositional
 chains. Full output: `benchmarks/results/summary_metrics.json`,
 `aegis_benchmarks.duckdb`, `aegis_benchmarks.parquet`, plus the Phase 8 tables
-`aegis_tla_checks.parquet` and `aegis_ebpf_equivalence.parquet`.
+`aegis_tla_checks.parquet` and `aegis_ebpf_equivalence.parquet` and the Phase 9
+tables `aegis_differential_fuzz.parquet` and `aegis_algebraic_properties.parquet`
+(eight DuckDB tables, five Parquet files in all).
 
 | Metric | Measured | Source |
 |---|---|---|
@@ -40,6 +42,8 @@ chains. Full output: `benchmarks/results/summary_metrics.json`,
 | **Max counterexample depth** | 4 hops | constructive witness traces |
 | **TLA+ model checking** | **486** states, zero violations, under the reference monitor; **1134** states clean on the safe config; **4 / 4** guard-removal mutations caught; corrupted `.cfg` refused | `aegis-cli check-tla` + `--suite tla` |
 | **eBPF decision equivalence** | 24 / 24 verdicts agree across the C hooks, the Rust simulator and the RFC 9669 VM; **5 / 5** fail-open mutations caught | `cargo test -p aegis-ebpf-loader` + `--suite ebpf` |
+| **Differential fuzz** | **1 000** generated cases, **14 000** probes, **100 %** three-way verdict equality (C hooks = Rust simulator = RFC 9669 VM); **900 / 900** injected mutant divergences caught | `cargo test -p aegis-ebpf-loader --test differential_fuzz` + `--suite fuzz` |
+| **Guard agreement** | **200 / 200** composition tuples agree across the TLA+ operators, the reference verifier and the emitted-script decision procedure; 200 hash cases + 64 lattice triples, fact sets consistent | `cargo test -p aegis-smt-verifier --test algebraic_properties` + `--suite fuzz` |
 | **Divergence separation** | benign max **0.0010**, malicious min **0.7361**, margin **0.7351** | ONNX Runtime |
 | **RAG ablation (nDCG@10)** | hybrid **0.6375** vs dense-only **0.5255**, 5/5 queries improved | hybrid + BM25 + RRF + 3-hop propagation |
 | **Scoring latency** | 2.80 ms min / 6.26 ms median end to end | 200 repetitions per stage |
@@ -73,7 +77,7 @@ chains. Full output: `benchmarks/results/summary_metrics.json`,
 
 ---
 
-## The four things this actually does
+## The five things this actually does
 
 ### 1. It extracts dataflow, not patterns
 
@@ -119,18 +123,28 @@ pinned to zero. The result is a **TACR**, signed with ECDSA P-256, which the
 BPF compiler turns into a cgroup policy. A rug pull changes `dtg_sha256`; the
 TACR no longer matches; the grant is revoked.
 
+### 5. It shows you the program it will run
+
+Post source to the gateway's loopback sandbox and the same binaries extract,
+verify, sign, compile to eBPF, **disassemble the exact bytecode the kernel
+would run**, and execute it in both decision engines — the reference simulator
+and the RFC 9669 VM — which must agree. Five compiled-in presets cover four
+attacks and one clean allow, and the portal panel (`GET /`) and
+`scripts/demo_walkthrough.py` drive the same pipeline, so the page cannot show
+a stale example.
+
 ---
 
 ## Layout
 
 ```
 C:\Pratham\AegisCPG\
-├── crates/                       Rust control plane — 403 tests, zero warnings
+├── crates/                       Rust control plane — 435 tests, zero warnings
 │   ├── aegis-common/             lattice, TACR, canonical hashing, ES256
 │   ├── aegis-dtg-parser/         Stage 1: lex, structure, taint, compress
 │   ├── aegis-smt-verifier/       Stage 3: product automaton, native TLA+ checker
 │   ├── aegis-ebpf-loader/        Stage 4: TACR → cgroup policy, RFC 9669 VM
-│   ├── aegis-proxy-gateway/      edit automaton, FIDO2, OAuth/PASETO, Cypher, portal
+│   ├── aegis-proxy-gateway/      edit automaton, FIDO2, OAuth/PASETO, Cypher, portal, live sandbox
 │   ├── aegis-cli/                scan / verify / check-tla / audit-and-enforce
 │   └── aegis-desktop-core/       mcp.json discovery + idempotent wrapping
 ├── ml-rag-engine/                Python control plane — 82 tests
@@ -147,9 +161,11 @@ C:\Pratham\AegisCPG\
 ├── apps/                         web portal view models, desktop firewall binary, mobile approver
 ├── specs/                        TLA+, SMT-LIB, JSON Schema, protobuf
 ├── ebpf-probes/                  LSM enforcer BPF program + native userspace shim
+├── scripts/                      final audit (14 gates), six-act walkthrough
+├── docs/                         judge defense, bug ledger and stage script
 ├── .toolchain/                   portable Rust/Python/Git, all contained
 ├── flow.md                       architecture and dataflow
-└── decisions.md                  ADR-001 … ADR-022 and a 12-bug post-mortem
+└── decisions.md                  ADR-001 … ADR-023 and a 12-bug post-mortem
 ```
 
 ---
@@ -176,17 +192,24 @@ node --test "apps/web-portal/tests/*.test.mjs"
 .\target\debug\aegis-cli.exe check-tla --spec specs\MCPShieldLTS.tla --config specs\MCPShieldLTS.safe.cfg
 .\target\debug\aegis-cli.exe audit-and-enforce --repo benchmarks\fixtures\vulnerable-lab
 
-# 6. Re-measure every number in this README
+# 6. Run the six-act judge walkthrough (extract → verify → model → sandbox → enforce → evidence)
+.\.toolchain\python\python.exe scripts\demo_walkthrough.py
+
+# 7. Re-measure every number in this README
 .\.toolchain\python\python.exe benchmarks\run_all_benchmarks.py
 
-# 7. Confirm all thirteen Hard-Rule gates in one command
+# 8. Confirm all fourteen Hard-Rule gates in one command
 .\.toolchain\python\python.exe scripts\final_audit.py
 ```
 
-Step 6 exits non-zero if any ADR-016 threshold regresses, and still writes its
-outputs so the failure is visible rather than silent. Step 7 checks Rules 1, 2,
-3, 4, 7, 8 and 10 together — containment, sole authorship, no placeholders, no
-LLM, module headers, commit hygiene, and reproducible benchmarks — and exits
+Step 6 drives the real binaries end to end — including the gateway's live
+sandbox over loopback HTTP — and exits non-zero the moment any act's claim
+stops holding; it needs the two Phase 9 test targets to have run, and
+`--smoke` reports missing artefacts as skipped instead. Step 7 exits non-zero
+if any ADR-016 threshold regresses, and still writes its outputs so the
+failure is visible rather than silent. Step 8 checks Rules 1, 2, 3, 4, 7, 8
+and 10 together — containment, sole authorship, no placeholders, no LLM,
+module headers, commit hygiene, and reproducible benchmarks — and exits
 non-zero on any of them. A gate that cannot run is a **failure**, not a skip.
 
 ---
@@ -235,6 +258,12 @@ error. Three of them made the headline metric wrong before they were fixed:
   at all.
 
 The full list, with how each was found, is in `decisions.md` under *Post-mortem*.
+Phase 9 added ten more, all in the verifier — nine encoder clauses that did not
+mean what the reference decided, and one reference-side violation that was
+silently dropped when a composition's source tool had no session data. They were
+found by the algebraic-properties suite, not by reading code, and every repair
+is pinned by a test that fails on the old code; the ledger is
+`docs/JUDGE_DEFENSE_AND_DEMO.md`.
 
 ---
 
@@ -242,13 +271,13 @@ The full list, with how each was found, is in `decisions.md` under *Post-mortem*
 
 | Suite | Command | Count |
 |---|---|---|
-| Rust control plane | `cargo test --workspace` | **403** |
+| Rust control plane | `cargo test --workspace` | **435** |
 | Python control plane | `pytest ml-rag-engine/tests` | **82** |
 | Web portal view models | `node --test apps/web-portal/tests` | **18** |
-| Hard-Rule audit | `python scripts/final_audit.py` | 13 gates |
-| Benchmark thresholds | `run_all_benchmarks.py` | 16 assertions |
+| Hard-Rule audit | `python scripts/final_audit.py` | 14 gates |
+| Benchmark thresholds | `run_all_benchmarks.py` | 22 assertions |
 
-All 503 tests and all 13 gates pass on this host.
+All 535 tests and all 14 gates pass on this host.
 
 ---
 

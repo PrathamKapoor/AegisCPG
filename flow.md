@@ -425,6 +425,16 @@ clean on the protected one; the unprotected configuration taken as configured
 yields a violation witness; four guard-removal mutations are each caught against
 their named invariant; a corrupted `.cfg` is refused before any checking.
 
+On hosts without a solver, the encode-versus-verify agreement is not asserted
+through Z3 at all: `cargo test -p aegis-smt-verifier --test algebraic_properties`
+decides 200 randomized composition tuples three ways -- the TLA+ operators of
+`specs/CompositionGuard.tla`, the reference verifier, and a decision procedure
+over the emitted SMT-LIB text (every fact symbol pinned to exactly one polarity;
+anything outside the decidable fragment fails closed) -- and requires all three
+readings to agree on every tuple. The first randomized run of this property
+found ten real defects in the encoder and the reference verifier (ADR-023; the
+ledger is `docs/JUDGE_DEFENSE_AND_DEMO.md` section 3).
+
 ### 4.8 Dynamic reflection is fail-closed, not guessed
 
 Any unresolvable dynamic dispatch yields `SinkKind::UnboundedDynamic`. Stage 3
@@ -631,6 +641,15 @@ plausible edit -- must each be caught by the harness's own self-check and named
 in its report; `benchmarks/run_all_benchmarks.py --suite ebpf` re-runs the whole
 gate and records the per-build diagnostics.
 
+On top of the 24-case table,
+`crates/aegis-ebpf-loader/tests/differential_fuzz.rs` generates a seeded
+1,000-case policy corpus (14,000 probes) and requires the three readers to agree
+on every verdict; a seeded mutant corpus (900 injected divergences) must be
+detected, so the equality is evidence rather than silence. The fuzz run takes
+about two minutes, so `benchmarks/run_all_benchmarks.py --suite fuzz` ingests
+the sealed summary of that run and re-asserts its pinned identity (seed, case
+and probe counts, three-way equality, mutant control).
+
 ---
 
 ## Flow 7 — Temporal Durable Step-Up Workflow & WebAuthn/FIDO2
@@ -684,6 +703,66 @@ Gateway        Temporal        Postgres/Timescale   tray/CLI     approval PWA
   timeout to allow.
 - Every state transition is replayable by Temporal's event history, so the audit
   trail is a by-product of execution rather than a separately-maintained log.
+
+---
+
+## Flow 8 — Live Code-to-eBPF Sandbox & Disassembler
+
+**Modules:** `crates/aegis-proxy-gateway` (`live_analyze.rs`, `http.rs`, `assets.rs`), `scripts/demo_walkthrough.py`
+
+### 8.1 WHAT
+
+A loopback-only surface that runs the whole pipeline on submitted source and
+shows the *executed decision program*: extraction, divergence signals,
+verification, signing, BPF compilation, disassembly, and the verdict from both
+decision engines -- for one request, in one page or one API call.
+
+### 8.2 WHY
+
+Every other claim in this document lives in test output or a committed
+artefact; a judge can reproduce it, but cannot watch it. The sandbox exists so
+the chain can be watched on the real binaries, with the disassembly on screen
+next to the verdict. It is deliberately part of the gateway rather than a
+separate tool: the presets are compiled into the binary and served by it, so
+the page cannot show a stale example.
+
+### 8.3 HOW — the wire
+
+| Route | Method | Purpose |
+|---|---|---|
+| `/api/live-analyze/presets` | GET | the five compiled-in examples (four malicious, one clean) |
+| `/api/live-analyze` | POST | run the chain over `{source, language, server_id?, clearance?, hook?, target?, write?}` |
+
+The response carries one object per stage: `stage1` (DTG counts, sinks,
+dependencies, injection markers, egress literals, tools, `H(DTG)`, the Cypher
+query and its rows), `stage2` (reached vs declared sink sets, divergence ratio,
+entropy, sensitive literals, the `flagged`/`consistent` verdict with its
+rationale), `stage3` (the four property checks, the emitted SMT script, which
+solver ran, the counterexample when one exists, the signed TACR and the PASETO
+token), and `stage4` (hook, target, the LLVM-dialect listing, the objdump-style
+disassembly, the assembled bytecode hex, RFC 9669 verification, map occupancy,
+and the simulator and VM verdicts with their agreement). The graph is also
+returned in the shape `GET /api/graph/:server_id` serves, so the portal renders
+it with the same code.
+
+The five presets, with the kernel verdict each demonstrates:
+
+| Preset | Language | Signals | Verdict |
+|---|---|---|---|
+| `js_indirect_shell` | JavaScript | CommandExec reached, description silent | DENY `bprm` on `/bin/sh` |
+| `postmark_bcc_rugpull` | JavaScript | BCC egress literal, no network call | DENY `socket` to `203.0.113.9` |
+| `py_env_harvester` | Python | EnvAccess plus a credential literal | DENY `file_open` on `/root/.aws/credentials` |
+| `py_injected_ssh_reader` | Python | injection marker plus a key-file sink | DENY `file_open` on `/root/.ssh/id_rsa` |
+| `ts_markdown_formatter` | TypeScript | none -- the allow case | ALLOW `file_open` on `/workspace/notes.md` |
+
+### 8.4 HOW — the six-act walkthrough
+
+`scripts/demo_walkthrough.py` drives the real binaries end to end -- the CLI
+for extract/verify/model/enforce, the gateway over loopback HTTP for the
+sandbox -- and fails closed: the default mode refuses to report success when a
+sealed artefact is missing, `--smoke` reports it skipped instead, and the whole
+run must finish inside a ten-second budget. The acts, the exact stage script,
+the ten-defect ledger and the judge Q&A are `docs/JUDGE_DEFENSE_AND_DEMO.md`.
 
 ---
 

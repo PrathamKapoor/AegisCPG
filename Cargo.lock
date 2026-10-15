@@ -72,6 +72,8 @@ version = "1.0.0"
 dependencies = [
  "aegis-common",
  "aegis-dtg-parser",
+ "aegis-ebpf-loader",
+ "aegis-smt-verifier",
  "axum",
  "base64",
  "futures-core",
@@ -88,6 +90,7 @@ name = "aegis-smt-verifier"
 version = "1.0.0"
 dependencies = [
  "aegis-common",
+ "aegis-dtg-parser",
  "serde",
  "serde_json",
 ]

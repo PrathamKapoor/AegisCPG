@@ -32,6 +32,7 @@
 
 use aegis_common::tacr::{TacrContract, TacrError};
 use aegis_common::types::{Capability, SinkKind};
+use crate::bpf_vm::{MapTable, VmMap};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A cgroup's compiled policy, mirroring `struct cgroup_policy` in the BPF C.
@@ -320,6 +321,126 @@ impl PolicySet {
         self.allowed_exec_inodes.insert(inode, digest);
         Ok(())
     }
+}
+
+/// Map id 1: cgroup id (8 bytes) -> `struct cgroup_policy` (16 bytes).
+pub const MAP_CGROUP_POLICY: u64 = 1;
+/// Map id 2: `{ cgroup id, inode }` (16 bytes) -> registered flag (1 byte).
+pub const MAP_EXEC_REGISTRY: u64 = 2;
+/// Map id 3: the shared LPM trie, key `{ u32 prefix_len, u8 path[128] }` ->
+/// `{ u32 owner_cgroup, u32 allow, u32 reserved[2] }`.
+pub const MAP_PATH_TRIE: u64 = 3;
+/// Map id 4: `{ cgroup id, u32 address, u32 reserved }` -> allowed flag.
+pub const MAP_NET_DESTINATIONS: u64 = 4;
+
+/// The path payload of an LPM trie key, matching `AEGIS_TARGET_LEN` in
+/// `ebpf-probes/lsm_enforcer.bpf.c` (pinned by `bpf_layout`'s cross-language
+/// check).
+pub const LPM_PATH_BYTES: usize = 128;
+
+/// The address of an exact host route (`a.b.c.d/32`), in the wire convention
+/// the hook and the C harness share: first octet in the low byte.
+///
+/// A wider CIDR has no key in an exact-match hash map and returns `None`; the
+/// caller must not round it to an address it does not name.
+pub fn exact_destination(cidr: &str) -> Option<u32> {
+    let (address, prefix) = cidr.split_once('/')?;
+    if prefix.trim() != "32" {
+        return None;
+    }
+    let octets: Vec<u32> = address
+        .split('.')
+        .map(|octet| octet.parse::<u32>().ok())
+        .collect::<Option<Vec<u32>>>()?;
+    if octets.len() != 4 || octets.iter().any(|octet| *octet > 255) {
+        return None;
+    }
+    Some(octets[0] | (octets[1] << 8) | (octets[2] << 16) | (octets[3] << 24))
+}
+
+/// Materialises one cgroup's compiled policy as the four kernel maps the
+/// decision programs index.
+///
+/// This is the bridge the live sandbox and the differential fuzzer need: the
+/// [`PolicySet`] the compiler produced, installed into a [`MapTable`] that the
+/// RFC 9669 VM can execute against, with byte layouts identical to the C
+/// harness's (`tests/shim_equivalence.rs` proves those bytes and the C decide
+/// identically, so this function cannot invent a layout the C disagrees with).
+///
+/// Three rules matter for agreement with [`KernelLsmSimulator`]:
+/// * allow prefixes are inserted before deny prefixes, so a deny entry with an
+///   identical path shadows the allow entry -- the same choice the simulator
+///   makes by scanning denies first with a strictly-longer-then-replace rule;
+/// * the registry is the *inode* view (`allowed_exec_inodes`), which is what
+///   the kernel can evaluate; the digest view stays with the simulator, and
+///   registration is what keeps the two from drifting;
+/// * only exact `/32` destinations are inserted. A wider CIDR is not
+///   representable in the kernel's hash map at all, and omitting it denies in
+///   the VM where the simulator would allow -- fail-closed, and pinned by a
+///   test below so the direction is a decision, not an accident.
+pub fn maps_for_policy(policy: &PolicySet) -> MapTable {
+    let mut table = MapTable::new();
+
+    let mut policies = VmMap::hash(8, 16);
+    let mut value = Vec::with_capacity(16);
+    for word in [
+        policy.cgroup_policy.allow_bitmask,
+        policy.cgroup_policy.deny_bitmask,
+        policy.cgroup_policy.max_lattice_level,
+        policy.cgroup_policy.enforce_mode,
+    ] {
+        value.extend_from_slice(&word.to_le_bytes());
+    }
+    policies
+        .insert(&policy.cgroup_id.to_le_bytes(), &value)
+        .expect("8-byte keys and 16-byte values fit the declared map shapes");
+    table.insert(MAP_CGROUP_POLICY, policies);
+
+    let mut registry = VmMap::hash(16, 1);
+    for inode in policy.allowed_exec_inodes.keys() {
+        let mut key = Vec::with_capacity(16);
+        key.extend_from_slice(&policy.cgroup_id.to_le_bytes());
+        key.extend_from_slice(&inode.to_le_bytes());
+        registry
+            .insert(&key, &[1])
+            .expect("16-byte keys and 1-byte values fit the declared map shapes");
+    }
+    table.insert(MAP_EXEC_REGISTRY, registry);
+
+    let mut trie = VmMap::lpm(4 + LPM_PATH_BYTES, 16);
+    for prefix in policy.allowed_paths.iter().chain(policy.denied_paths.iter()) {
+        let mut key = Vec::with_capacity(4 + LPM_PATH_BYTES);
+        key.extend_from_slice(&prefix.prefix_len.to_le_bytes());
+        let mut data = [0u8; LPM_PATH_BYTES];
+        let significant = prefix.data.len().min(LPM_PATH_BYTES);
+        data[..significant].copy_from_slice(&prefix.data[..significant]);
+        key.extend_from_slice(&data);
+        let mut value = Vec::with_capacity(16);
+        // The hook compares the owner in 32 bits, so the value carries the low
+        // half of the cgroup id -- exactly what the C fixture stores.
+        for word in [policy.cgroup_id as u32, u32::from(prefix.allow), 0, 0] {
+            value.extend_from_slice(&word.to_le_bytes());
+        }
+        trie.insert(&key, &value)
+            .expect("LPM keys fit the trie's declared key size");
+    }
+    table.insert(MAP_PATH_TRIE, trie);
+
+    let mut net = VmMap::hash(16, 1);
+    for cidr in &policy.allowed_net_cidrs {
+        let Some(address) = exact_destination(cidr) else {
+            continue;
+        };
+        let mut key = Vec::with_capacity(16);
+        key.extend_from_slice(&policy.cgroup_id.to_le_bytes());
+        key.extend_from_slice(&address.to_le_bytes());
+        key.extend_from_slice(&0u32.to_le_bytes());
+        net.insert(&key, &[1])
+            .expect("16-byte keys and 1-byte values fit the declared map shapes");
+    }
+    table.insert(MAP_NET_DESTINATIONS, net);
+
+    table
 }
 
 /// The three LSM hooks the enforcer installs.
@@ -1064,5 +1185,216 @@ mod tests {
             "cgroup 2's prefix must not admit an open in cgroup 1"
         );
         assert_eq!(sim.file_open(2, "/b/x", false, "py").0, Verdict::Allow);
+    }
+
+    // ------------------------------------------------------------------
+    // maps_for_policy: a compiled policy as kernel map bytes.
+    //
+    // The property the live sandbox and the differential fuzzer rest on is
+    // here: the bytes this function writes into a MapTable must produce the
+    // same verdict as KernelLsmSimulator, the reference decision table the C
+    // harness and the BPF assembly were both written against.
+    // ------------------------------------------------------------------
+
+    /// Runs one decision program and reports whether it returned 0 (allow).
+    fn vm_allow(maps: &mut crate::bpf_vm::MapTable, assembly: &str, context: &[u8]) -> bool {
+        crate::bpf_vm::Vm::new(maps)
+            .run_assembly(assembly, context)
+            .expect("the decision program must run")
+            == 0
+    }
+
+    fn bprm_context(cgroup: u64, inode: u64) -> Vec<u8> {
+        let mut context = cgroup.to_le_bytes().to_vec();
+        context.extend_from_slice(&inode.to_le_bytes());
+        context
+    }
+
+    fn file_context(cgroup: u64, flags: u64, path: &str) -> Vec<u8> {
+        let mut context = cgroup.to_le_bytes().to_vec();
+        context.extend_from_slice(&flags.to_le_bytes());
+        let mut data = [0u8; 128];
+        data[..path.len()].copy_from_slice(path.as_bytes());
+        context.extend_from_slice(&data);
+        context
+    }
+
+    fn socket_context(cgroup: u64, address: u32) -> Vec<u8> {
+        let mut context = cgroup.to_le_bytes().to_vec();
+        context.extend_from_slice(&u64::from(address).to_le_bytes());
+        context.extend_from_slice(&2u64.to_le_bytes());
+        context
+    }
+
+    #[test]
+    fn maps_for_policy_reproduces_the_reference_simulator_verdicts() {
+        use crate::bpf_vm::{BPRM_CHECK_SECURITY_ASM, FILE_OPEN_ASM, SOCKET_CONNECT_ASM};
+
+        let digest = "ab".repeat(32);
+        let caps = GrantedCapabilities {
+            file_read_prefixes: vec!["/workspace".into()],
+            file_write_prefixes: vec!["/workspace/out".into()],
+            allowed_exec_sha256: [digest.clone()].into_iter().collect(),
+            allowed_net_cidrs: ["203.0.113.9/32".into()].into_iter().collect(),
+            allow_env_read: false,
+            allow_dynamic_reflection: false,
+        };
+        let mut policy = compile(
+            &contract(caps.clone(), SecurityLattice::Confidential),
+            4242,
+            &sink_set_for(&caps),
+        )
+        .expect("the fixture contract must compile");
+        policy
+            .register_verified_executable(558, &digest)
+            .expect("the digest is on the contract's allowlist");
+
+        let mut simulator = KernelLsmSimulator::new();
+        simulator.install(policy.clone());
+        let mut maps = maps_for_policy(&policy);
+
+        // file_open: a read inside the granted prefix, a path under the deny
+        // prefix nested inside it, a write riding the granted prefix, and a
+        // path outside every prefix. Each is asserted on both engines before
+        // the comparison, so a broken fixture cannot pass as agreement.
+        for (path, write, expected) in [
+            ("/workspace/report.md", false, Verdict::Allow),
+            ("/workspace/out/report.md", false, Verdict::DenyEperm),
+            ("/workspace/out/report.md", true, Verdict::DenyEperm),
+            ("/workspace/report.md", true, Verdict::Allow),
+            ("/etc/shadow", false, Verdict::DenyEperm),
+        ] {
+            let (simulator_verdict, _) = simulator.file_open(4242, path, write, "sandbox");
+            assert_eq!(simulator_verdict, expected, "simulator on {path} (write={write})");
+            let flags = if write { 1u64 } else { 0 };
+            let vm = vm_allow(&mut maps, FILE_OPEN_ASM, &file_context(4242, flags, path));
+            assert_eq!(vm, expected == Verdict::Allow, "VM on {path} (write={write})");
+        }
+
+        // bprm: the registered inode is allowed because the digest was on the
+        // allowlist; an unregistered inode with an unknown digest is denied on
+        // both engines.
+        let (simulator_verdict, _) =
+            simulator.bprm_check_security(4242, "/usr/bin/tool", &digest, "tool");
+        assert_eq!(simulator_verdict, Verdict::Allow);
+        assert!(vm_allow(&mut maps, BPRM_CHECK_SECURITY_ASM, &bprm_context(4242, 558)));
+        let unknown = "ff".repeat(32);
+        let (simulator_verdict, _) =
+            simulator.bprm_check_security(4242, "/bin/sh", &unknown, "sh");
+        assert_eq!(simulator_verdict, Verdict::DenyEperm);
+        assert!(!vm_allow(&mut maps, BPRM_CHECK_SECURITY_ASM, &bprm_context(4242, 999)));
+
+        // socket: the exact granted destination is allowed, a neighbour is not.
+        assert_eq!(
+            simulator.socket_connect(4242, "203.0.113.9", 443, "curl").0,
+            Verdict::Allow
+        );
+        let granted = exact_destination("203.0.113.9/32").expect("a host route");
+        assert!(vm_allow(&mut maps, SOCKET_CONNECT_ASM, &socket_context(4242, granted)));
+        assert_eq!(
+            simulator.socket_connect(4242, "203.0.113.10", 443, "curl").0,
+            Verdict::DenyEperm
+        );
+        let neighbour = exact_destination("203.0.113.10/32").expect("a host route");
+        assert!(!vm_allow(&mut maps, SOCKET_CONNECT_ASM, &socket_context(4242, neighbour)));
+
+        // A cgroup with no policy: both engines deny every hook.
+        assert_eq!(
+            simulator.file_open(9999, "/workspace/report.md", false, "x").0,
+            Verdict::DenyEperm
+        );
+        assert!(!vm_allow(
+            &mut maps,
+            FILE_OPEN_ASM,
+            &file_context(9999, 0, "/workspace/report.md")
+        ));
+    }
+
+    #[test]
+    fn identical_allow_and_deny_prefixes_deny_in_both_engines() {
+        // A tool granted read and write over the same prefix compiles to an
+        // allow entry and a deny entry with identical bits. The simulator scans
+        // denies first and keeps them on a length tie; a kernel map cannot hold
+        // both keys at all, so maps_for_policy must keep the deny there too.
+        // This pins that choice instead of leaving it to insertion order.
+        use crate::bpf_vm::FILE_OPEN_ASM;
+
+        let caps = GrantedCapabilities {
+            file_read_prefixes: vec!["/workspace".into()],
+            file_write_prefixes: vec!["/workspace".into()],
+            ..Default::default()
+        };
+        let policy = compile(
+            &contract(caps.clone(), SecurityLattice::Confidential),
+            7,
+            &sink_set_for(&caps),
+        )
+        .expect("the fixture contract must compile");
+        let mut simulator = KernelLsmSimulator::new();
+        simulator.install(policy.clone());
+        let mut maps = maps_for_policy(&policy);
+
+        for path in ["/workspace/a.txt", "/workspace"] {
+            let (simulator_verdict, _) = simulator.file_open(7, path, false, "x");
+            assert_eq!(simulator_verdict, Verdict::DenyEperm, "simulator on {path}");
+            assert!(
+                !vm_allow(&mut maps, FILE_OPEN_ASM, &file_context(7, 0, path)),
+                "VM on {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wider_cidr_is_not_rounded_to_one_address() {
+        // An exact-match hash map cannot express /8, so the VM denies what the
+        // simulator's prefix match would allow. That direction is fail-closed,
+        // and this test pins it so nobody "fixes" it by inserting 10.0.0.0 and
+        // silently allowing an address the policy never named.
+        use crate::bpf_vm::SOCKET_CONNECT_ASM;
+
+        let caps = GrantedCapabilities {
+            allowed_net_cidrs: ["10.0.0.0/8".into()].into_iter().collect(),
+            ..Default::default()
+        };
+        let policy = compile(
+            &contract(caps.clone(), SecurityLattice::Confidential),
+            9,
+            &sink_set_for(&caps),
+        )
+        .expect("the fixture contract must compile");
+        let mut simulator = KernelLsmSimulator::new();
+        simulator.install(policy.clone());
+        let mut maps = maps_for_policy(&policy);
+
+        assert_eq!(
+            simulator.socket_connect(9, "10.1.2.3", 443, "curl").0,
+            Verdict::Allow,
+            "the simulator matches CIDR prefixes"
+        );
+        let address = exact_destination("10.1.2.3/32").expect("a host route");
+        assert!(
+            !vm_allow(&mut maps, SOCKET_CONNECT_ASM, &socket_context(9, address)),
+            "the kernel map holds no entry for a /8, so the VM must deny"
+        );
+    }
+
+    #[test]
+    fn exact_destination_parses_only_host_routes() {
+        // The integer convention is the harness's: the first octet sits in the
+        // low byte, exactly what `dotted_address` in `tests/shim_equivalence.rs`
+        // decodes and what the C fixture's `net_put` values use.
+        assert_eq!(exact_destination("203.0.113.9/32"), Some(0x0971_00CB));
+        assert_eq!(exact_destination("203.113.0.9/32"), Some(0x0900_71CB));
+        assert_eq!(exact_destination("0.0.0.0/32"), Some(0));
+        assert_eq!(exact_destination("1.2.3.4/32"), Some(0x0403_0201));
+        // Wider prefixes name a set, not an address.
+        assert_eq!(exact_destination("10.0.0.0/8"), None);
+        assert_eq!(exact_destination("203.0.113.0/24"), None);
+        // Malformed input is refused, never defaulted.
+        assert_eq!(exact_destination("203.0.113.9"), None);
+        assert_eq!(exact_destination("203.0.113.9/33"), None);
+        assert_eq!(exact_destination("256.0.0.1/32"), None);
+        assert_eq!(exact_destination("a.b.c.d/32"), None);
+        assert_eq!(exact_destination("203.0.113.9/32/32"), None);
     }
 }

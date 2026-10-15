@@ -7,11 +7,17 @@ WHAT
     Runs the compiled `aegis-cli.exe` over the 14 shipped fixtures and the 50
     compositional exfiltration chains, runs the real divergence model and the
     real retriever over the results, model-checks the shipped TLA+ specification
-    through `aegis-cli check-tla`, and drives the real eBPF three-way
-    equivalence gate (the freestanding C hooks, the Rust simulator, the RFC 9669
-    VM) over its 24-case table. The measurements go to three formats: DuckDB,
-    Parquet, and a JSON summary; the TLA+ and eBPF tables get their own Parquet
-    files beside the union one.
+    through `aegis-cli check-tla`, drives the real eBPF three-way equivalence
+    gate (the freestanding C hooks, the Rust simulator, the RFC 9669 VM) over
+    its 24-case table, and folds in the Phase 9 verification artefacts: the
+    1,000-case three-way differential fuzz and the algebraic-properties guard
+    agreement, both read back from the summaries their `cargo test` targets
+    seal rather than re-run here. The measurements go to three formats: DuckDB,
+    Parquet, and a JSON summary. Eight tables are written; the TLA+, eBPF and
+    differential-fuzz tables get their own Parquet files beside the union one,
+    and the algebraic-properties report -- a fixed three-row suite summary
+    rather than measured benchmark data -- is exported as the fifth Parquet
+    file without occupying a table of its own.
 
 WHY THE CLI IS INVOKED RATHER THAN REIMPLEMENTED
     The extractor is 2400 lines of Rust with a hop-bounded taint propagation
@@ -98,6 +104,18 @@ EBPF_MUTATION_BUILDS = [
 #: The pinned scenario table the C harness runs.
 EBPF_CASES = 24
 
+#: Where the Phase 9 test targets leave their sealed summaries. The fuzz run
+#: takes about two minutes and is *ingested*, not re-run: the harness re-asserts
+#: its pinned identity (seed, counts, three-way equality, mutant control) so a
+#: drifted experiment cannot pass as a benchmark.
+FUZZ_SUMMARY = REPO_ROOT / "target" / "differential-fuzz" / "fuzz_summary.json"
+ALGEBRA_SUMMARY = REPO_ROOT / "target" / "algebraic-properties" / "summary.json"
+FUZZ_SEED = "0xae615c9620260008"
+FUZZ_CASES = 1000
+ALGEBRA_HASH_CASES = 200
+ALGEBRA_LATTICE_TRIPLES = 64
+ALGEBRA_TUPLE_CASES = 200
+
 #: `aegis-cli` exit codes, so a suite can assert the gate the CLI declared.
 EXIT_OK = 0
 EXIT_VIOLATIONS = 1
@@ -116,6 +134,8 @@ THRESHOLDS = {
     "min_benign_fixture_score_ceiling": 0.05,
     "max_end_to_end_scoring_ms": 15.0,
     "min_tla_clean_states": 200,
+    "min_fuzz_cases": 1000,
+    "min_guard_agreements": 200,
 }
 
 
@@ -282,6 +302,29 @@ class EbpfRow:
     executable_bytes: int
     duration_ms: float
     passed: bool
+
+
+@dataclass
+class FuzzRow:
+    """One differential-fuzz run's sealed summary.
+
+    The three readers are the freestanding C hooks, the Rust simulator and the
+    RFC 9669 VM; `three_way_equal` is their verdict equality over the whole
+    corpus, and the mutant control is what makes that equality evidence rather
+    than silence: a comparison that cannot detect an injected divergence proves
+    nothing.
+    """
+
+    seed: str
+    cases: int
+    probes: int
+    allows: int
+    denials: int
+    script_bytes: int
+    three_way_equal: bool
+    batch_millis: float
+    mutant_control_divergences: int
+    mutant_control_fixture_failures: int
 
 
 # ---------------------------------------------------------------------------
@@ -963,6 +1006,76 @@ def run_ebpf_suite() -> tuple[list[EbpfRow], dict]:
     return rows, gate
 
 
+def run_fuzz_suite() -> tuple[list[FuzzRow], dict]:
+    """Read the Phase 9 sealed artefacts and re-assert their pinned identity.
+
+    The 1,000-case differential fuzzer takes about two minutes, so the harness
+    does not re-run it: it reads the summary the `differential_fuzz` cargo
+    target seals, checks the seed, the case and probe counts, the three-way
+    verdict equality and the mutant control, and turns it into one row. The
+    algebraic-properties report is read the same way and returned verbatim for
+    the summary and the Parquet export. A missing artefact is a hard failure --
+    a benchmark that silently measures nothing is worse than one that stops --
+    and the error names the command that produces it.
+    """
+    if not FUZZ_SUMMARY.exists():
+        raise FileNotFoundError(
+            f"missing {FUZZ_SUMMARY.relative_to(REPO_ROOT)}; produce it with "
+            "`cargo test -p aegis-ebpf-loader --test differential_fuzz`"
+        )
+    if not ALGEBRA_SUMMARY.exists():
+        raise FileNotFoundError(
+            f"missing {ALGEBRA_SUMMARY.relative_to(REPO_ROOT)}; produce it with "
+            "`cargo test -p aegis-smt-verifier --test algebraic_properties`"
+        )
+    fuzz = json.loads(FUZZ_SUMMARY.read_text(encoding="utf-8"))
+    algebra = json.loads(ALGEBRA_SUMMARY.read_text(encoding="utf-8"))
+
+    if fuzz["seed"] != FUZZ_SEED:
+        raise ValueError(
+            f"the fuzz artefact carries seed {fuzz['seed']}, expected {FUZZ_SEED}"
+        )
+    if fuzz["cases"] != FUZZ_CASES:
+        raise ValueError(
+            f"the fuzz artefact carries {fuzz['cases']} cases, expected {FUZZ_CASES}"
+        )
+    if fuzz["allows"] + fuzz["denials"] != fuzz["probes"]:
+        raise ValueError("the fuzz verdict counts do not sum to the probe count")
+    if not fuzz["three_way_equal"]:
+        raise ValueError("the three-way fuzz verdict equality did not hold")
+    if fuzz["mutant_control_divergences"] <= 0:
+        raise ValueError("the fuzz mutant control caught nothing")
+
+    inputs = algebra["inputs"]
+    guard = algebra["property_c"]
+    if (
+        inputs["dtg_hash_cases"] != ALGEBRA_HASH_CASES
+        or inputs["lattice_triples"] != ALGEBRA_LATTICE_TRIPLES
+        or inputs["tuple_cases"] != ALGEBRA_TUPLE_CASES
+    ):
+        raise ValueError(f"the algebraic artefact carries drifted inputs: {inputs}")
+    if guard["three_way_agreements"] != ALGEBRA_TUPLE_CASES or not guard["facts_consistent"]:
+        raise ValueError("the guard agreement did not hold on every tuple")
+
+    rows = [
+        FuzzRow(
+            seed=fuzz["seed"],
+            cases=int(fuzz["cases"]),
+            probes=int(fuzz["probes"]),
+            allows=int(fuzz["allows"]),
+            denials=int(fuzz["denials"]),
+            script_bytes=int(fuzz["script_bytes"]),
+            three_way_equal=bool(fuzz["three_way_equal"]),
+            batch_millis=round(float(fuzz["batch_millis"]), 4),
+            mutant_control_divergences=int(fuzz["mutant_control_divergences"]),
+            mutant_control_fixture_failures=int(
+                fuzz["mutant_control_fixture_failures"]
+            ),
+        )
+    ]
+    return rows, algebra
+
+
 # ---------------------------------------------------------------------------
 # Aggregation
 # ---------------------------------------------------------------------------
@@ -975,12 +1088,17 @@ def summarise(
     tla_rows: Sequence[TlaRow],
     ebpf_rows: Sequence[EbpfRow],
     ebpf_gate: dict,
+    fuzz_rows: Sequence[FuzzRow],
+    algebra_report: dict,
     started: float,
 ) -> dict:
     vulnerable = [r for r in static_rows if r.expected_malicious]
     benign = [r for r in static_rows if not r.expected_malicious]
     clean_tla = [r for r in tla_rows if r.kind == "clean"]
     clean_ebpf = next((r for r in ebpf_rows if r.kind == "equivalence"), None)
+    fuzz = fuzz_rows[0] if fuzz_rows else None
+    algebra_inputs = algebra_report.get("inputs", {})
+    algebra_guard = algebra_report.get("property_c", {})
 
     recall = sum(1 for r in vulnerable if r.detected)
     false_positives = sum(1 for r in benign if r.detected)
@@ -1125,6 +1243,31 @@ def summarise(
             "total_mismatch_lines": sum(r.mismatches for r in ebpf_rows),
             "clean_executable_bytes": clean_ebpf.executable_bytes if clean_ebpf else 0,
         },
+        "fuzz": {
+            "seed": fuzz.seed if fuzz else "",
+            "cases": fuzz.cases if fuzz else 0,
+            "probes": fuzz.probes if fuzz else 0,
+            "allows": fuzz.allows if fuzz else 0,
+            "denials": fuzz.denials if fuzz else 0,
+            "script_bytes": fuzz.script_bytes if fuzz else 0,
+            "three_way_equal": fuzz.three_way_equal if fuzz else False,
+            "batch_millis": fuzz.batch_millis if fuzz else 0.0,
+            "mutant_control_divergences": fuzz.mutant_control_divergences if fuzz else 0,
+            "mutant_control_fixture_failures": (
+                fuzz.mutant_control_fixture_failures if fuzz else 0
+            ),
+            "implementations_compared": 3,
+        },
+        "algebraic": {
+            "spec": algebra_guard.get("spec", ""),
+            "seed": algebra_report.get("seed", ""),
+            "dtg_hash_cases": algebra_inputs.get("dtg_hash_cases", 0),
+            "lattice_triples": algebra_inputs.get("lattice_triples", 0),
+            "tuple_cases": algebra_inputs.get("tuple_cases", 0),
+            "three_way_agreements": algebra_guard.get("three_way_agreements", 0),
+            "facts_consistent": bool(algebra_guard.get("facts_consistent", False)),
+            "shapes": algebra_guard.get("shapes", {}),
+        },
         "latency_ms": {row.stage: row.minimum for row in latency_rows},
         "latency_median_ms": {row.stage: row.median for row in latency_rows},
         "latency_p95_ms": {row.stage: row.p95 for row in latency_rows},
@@ -1216,6 +1359,26 @@ def check_thresholds(summary: dict) -> list[str]:
         failures.append(
             f"the clean eBPF sweep reported {ebpf['clean_mismatches']} mismatches"
         )
+    fuzz = summary["fuzz"]
+    if fuzz["cases"] < THRESHOLDS["min_fuzz_cases"]:
+        failures.append(
+            f"differential fuzz ran {fuzz['cases']} cases < "
+            f"{THRESHOLDS['min_fuzz_cases']}"
+        )
+    if fuzz["probes"] and fuzz["allows"] + fuzz["denials"] != fuzz["probes"]:
+        failures.append("the fuzz verdict counts do not sum to the probe count")
+    if not fuzz["three_way_equal"]:
+        failures.append("the three-way fuzz verdict equality did not hold")
+    if fuzz["mutant_control_divergences"] <= 0:
+        failures.append("the fuzz mutant control caught nothing")
+    algebraic = summary["algebraic"]
+    if algebraic["three_way_agreements"] < THRESHOLDS["min_guard_agreements"]:
+        failures.append(
+            f"guard agreements {algebraic['three_way_agreements']} < "
+            f"{THRESHOLDS['min_guard_agreements']}"
+        )
+    if not algebraic["facts_consistent"]:
+        failures.append("the emitted guard facts were not consistent")
     return failures
 
 
@@ -1246,7 +1409,15 @@ def _duckdb_type(annotation: str) -> str:
 
 
 def write_duckdb(
-    static_rows, chain_rows, divergence_rows, rag_rows, latency_rows, tla_rows, ebpf_rows
+    static_rows,
+    chain_rows,
+    divergence_rows,
+    rag_rows,
+    latency_rows,
+    tla_rows,
+    ebpf_rows,
+    fuzz_rows,
+    algebra_report,
 ) -> dict[str, str]:
     """Write every table to DuckDB, then export the Parquet copies.
 
@@ -1283,6 +1454,7 @@ def write_duckdb(
     load("latency", latency_rows, LatencyRow)
     load("tla_model_checks", tla_rows, TlaRow)
     load("ebpf_equivalence", ebpf_rows, EbpfRow)
+    load("differential_fuzz", fuzz_rows, FuzzRow)
 
     def export(table: str, parquet: Path) -> None:
         if parquet.exists():
@@ -1304,12 +1476,42 @@ def write_duckdb(
     export("tla_model_checks", tla_parquet)
     ebpf_parquet = RESULTS_DIR / "aegis_ebpf_equivalence.parquet"
     export("ebpf_equivalence", ebpf_parquet)
+    fuzz_parquet = RESULTS_DIR / "aegis_differential_fuzz.parquet"
+    export("differential_fuzz", fuzz_parquet)
+
+    # The algebraic-properties report is three fixed rows, exported straight
+    # from a VALUES query: it is a suite summary, not measured benchmark data,
+    # so it does not occupy a DuckDB table of its own.
+    algebra_parquet = RESULTS_DIR / "aegis_algebraic_properties.parquet"
+    if algebra_parquet.exists():
+        algebra_parquet.unlink()
+    inputs = algebra_report.get("inputs", {})
+    guard = algebra_report.get("property_c", {})
+    seed = algebra_report.get("seed", "")
+    consistent = "TRUE" if guard.get("facts_consistent") else "FALSE"
+    hash_cases = int(inputs.get("dtg_hash_cases", 0))
+    lattice_triples = int(inputs.get("lattice_triples", 0))
+    tuple_cases = int(inputs.get("tuple_cases", 0))
+    agreements = int(guard.get("three_way_agreements", 0))
+    connection.execute(
+        "COPY (SELECT * FROM (VALUES "
+        f"('dtg_hash', '{seed}', {hash_cases}, {hash_cases}, {consistent}, "
+        "'re-extraction determinism, sink-argument sensitivity, comment insensitivity'), "
+        f"('lattice', '{seed}', {lattice_triples}, {lattice_triples}, {consistent}, "
+        "'exhaustive 4^3 join/meet/order/step-up laws'), "
+        f"('guard_agreement', '{seed}', {tuple_cases}, {agreements}, {consistent}, "
+        "'TLA+ operators, reference verifier and emitted-script decision procedure')"
+        ") AS algebraic_properties(suite, seed, inputs, agreements, consistent, detail)) "
+        f"TO '{algebra_parquet.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)"
+    )
     connection.close()
     return {
         "duckdb": str(database.relative_to(REPO_ROOT)),
         "parquet": str(parquet.relative_to(REPO_ROOT)),
         "tla_parquet": str(tla_parquet.relative_to(REPO_ROOT)),
         "ebpf_parquet": str(ebpf_parquet.relative_to(REPO_ROOT)),
+        "fuzz_parquet": str(fuzz_parquet.relative_to(REPO_ROOT)),
+        "algebra_parquet": str(algebra_parquet.relative_to(REPO_ROOT)),
     }
 
 
@@ -1318,7 +1520,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--suite",
         default="all",
-        help="all | static | chains | rag | divergence | latency | tla | ebpf",
+        help="all | static | chains | rag | divergence | latency | tla | ebpf | fuzz",
     )
     parser.add_argument(
         "--no-persist",
@@ -1329,7 +1531,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     started = time.time()
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    suites = {"static", "chains", "rag", "divergence", "latency", "tla", "ebpf"}
+    suites = {"static", "chains", "rag", "divergence", "latency", "tla", "ebpf", "fuzz"}
     chosen = suites if args.suite == "all" else {args.suite}
 
     print(f"aegis-cli     : {CLI}", flush=True)
@@ -1422,6 +1624,27 @@ def main(argv: Sequence[str] | None = None) -> int:
                 flush=True,
             )
 
+    fuzz_rows: list[FuzzRow] = []
+    algebra_report: dict = {}
+    if "fuzz" in chosen:
+        print("\n== differential fuzz and algebraic properties (sealed artefacts) ==", flush=True)
+        fuzz_rows, algebra_report = run_fuzz_suite()
+        for row in fuzz_rows:
+            print(
+                f"  fuzz: {row.cases} cases, {row.probes} probes, "
+                f"{row.allows} allow / {row.denials} deny, "
+                f"three_way_equal={row.three_way_equal}, "
+                f"mutants={row.mutant_control_divergences}",
+                flush=True,
+            )
+        guard = algebra_report.get("property_c", {})
+        print(
+            f"  algebraic: {algebra_report.get('inputs', {})} "
+            f"guard agreements={guard.get('three_way_agreements')} "
+            f"facts_consistent={guard.get('facts_consistent')}",
+            flush=True,
+        )
+
     summary = summarise(
         static_rows,
         chain_rows,
@@ -1431,6 +1654,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         tla_rows,
         ebpf_rows,
         ebpf_gate,
+        fuzz_rows,
+        algebra_report,
         started,
     )
     summary["thresholds"] = THRESHOLDS
@@ -1456,12 +1681,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         latency_rows,
         tla_rows,
         ebpf_rows,
+        fuzz_rows,
+        algebra_report,
     )
     print(f"\nwritten benchmarks/results/summary_metrics.json", flush=True)
     print(f"written {paths['duckdb']}", flush=True)
     print(f"written {paths['parquet']}", flush=True)
     print(f"written {paths['tla_parquet']}", flush=True)
     print(f"written {paths['ebpf_parquet']}", flush=True)
+    print(f"written {paths['fuzz_parquet']}", flush=True)
+    print(f"written {paths['algebra_parquet']}", flush=True)
 
     if failures:
         print("\nTHRESHOLD FAILURES:", flush=True)
