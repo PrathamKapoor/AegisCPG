@@ -170,6 +170,13 @@ pub struct GatewayState {
     pub oauth: Mutex<OauthServer>,
     /// The PASETO v3.public issuer.
     pub paseto: PasetoIssuer,
+    /// The divergence model seam: `Some` when the trained head's manifest
+    /// loaded, `None` when the gateway runs without it. The live analyzer
+    /// reads this to decide between a scored Stage 2 and an unreviewed one.
+    pub divergence: Option<Arc<crate::grpc_bridge::GrpcBridge>>,
+    /// The append-only audit ledger behind `/api/ledger`: every enforcement
+    /// decision appends here, hash-chained, so tampering is detectable.
+    pub ledger: Mutex<crate::audit_ledger::AuditLedger>,
 }
 
 impl GatewayState {
@@ -200,6 +207,31 @@ impl GatewayState {
                 PASETO_TTL_SECS,
             )
             .expect("the library default PASETO seed is a valid P-256 scalar"),
+            divergence: None,
+            ledger: Mutex::new(crate::audit_ledger::AuditLedger::new()),
+        }
+    }
+
+    /// Attaches the native divergence head's bridge, after the state is
+    /// built and before it is shared.
+    ///
+    /// Separate from [`GatewayState::from_grants`] because loading the
+    /// manifest is an environment-dependent side effect: startup logs where
+    /// the head came from, and the tests pin both the attached and the
+    /// headless behaviour.
+    pub fn attach_divergence(&mut self, bridge: Arc<crate::grpc_bridge::GrpcBridge>) {
+        self.divergence = Some(bridge);
+    }
+
+    /// Appends one enforced decision to the audit ledger.
+    ///
+    /// The ledger is the durable record of what this process enforced, so
+    /// every decision path that emits a telemetry event should also leave
+    /// its chain entry here: the feed serves the UI, the ledger serves the
+    /// audit.
+    pub fn ledger_append(&self, entry: crate::audit_ledger::PendingEntry) {
+        if let Ok(mut ledger) = self.ledger.lock() {
+            ledger.append(entry);
         }
     }
 
@@ -1250,6 +1282,80 @@ pub async fn handle_health(State(state): State<Arc<GatewayState>>) -> Json<Healt
     })
 }
 
+/// `GET /api/ledger` -- the append-only enforcement ledger, in chain order,
+/// with the tip so a consumer can diff what it recorded last.
+pub async fn handle_ledger(State(state): State<Arc<GatewayState>>) -> Response {
+    let read = match state.ledger.lock() {
+        Ok(ledger) => Ok((
+            ledger.tip().to_string(),
+            ledger.len(),
+            serde_json::to_value(ledger.records()).unwrap_or(serde_json::Value::Null),
+        )),
+        Err(_) => Err(()),
+    };
+    match read {
+        Ok((tip, count, records)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "schema": crate::audit_ledger::LEDGER_SCHEMA_V1,
+                "author": aegis_common::AEGIS_AUTHOR,
+                "product": aegis_common::AEGIS_PRODUCT,
+                "tip": tip,
+                "records": records,
+                "len": count,
+            })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "the ledger lock was poisoned; the audit trail is unavailable"
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /api/ledger/verify` -- recomputes every hash over the content the
+/// reads would return, and names the first sequence number that fails.
+///
+/// A tampered ledger is `ok: false` with `tampered_seq` set; the check object
+/// is exactly what the operator pastes into an incident report.
+pub async fn handle_ledger_verify(State(state): State<Arc<GatewayState>>) -> Response {
+    let read = match state.ledger.lock() {
+        Ok(ledger) => Ok((ledger.verify(), ledger.tip().to_string(), ledger.len())),
+        Err(_) => Err(()),
+    };
+    match read {
+        Ok((verdict, tip, count)) => {
+            let (ok, tampered_seq) = match verdict {
+                Ok(()) => (true, None),
+                Err(error) => (false, Some(error.seq_no)),
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "schema": crate::audit_ledger::LEDGER_SCHEMA_V1,
+                    "author": aegis_common::AEGIS_AUTHOR,
+                    "product": aegis_common::AEGIS_PRODUCT,
+                    "ok": ok,
+                    "records": count,
+                    "tip": tip,
+                    "tampered_seq": tampered_seq,
+                })),
+            )
+                .into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "the ledger lock was poisoned; the audit trail is unavailable"
+            })),
+        )
+            .into_response(),
+    }
+}
+
 /// One server in `GET /api/servers`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ServerSummary {
@@ -1369,7 +1475,12 @@ pub async fn handle_live_analyze(
     State(state): State<Arc<GatewayState>>,
     Json(request): Json<LiveAnalyzeRequest>,
 ) -> Response {
-    match live_analyze::analyze(&request, &state.paseto, state.now()) {
+    match live_analyze::analyze(
+        &request,
+        state.divergence.as_deref(),
+        &state.paseto,
+        state.now(),
+    ) {
         Ok(response) => {
             state.emit(
                 "live_analyze",
@@ -1612,6 +1723,10 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/api/live-analyze/presets", get(handle_live_presets))
         .route("/api/metrics", get(handle_metrics_json))
         .route("/api/events", get(handle_events))
+        // The audit trail: what this process enforced, hash-chained, and the
+        // check to prove it still reads back.
+        .route("/api/ledger", get(handle_ledger))
+        .route("/api/ledger/verify", get(handle_ledger_verify))
         .route("/metrics", get(handle_metrics_prometheus))
         .with_state(state)
 }

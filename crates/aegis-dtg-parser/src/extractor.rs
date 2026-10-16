@@ -276,7 +276,7 @@ fn import_forms(language: Language) -> &'static [(&'static str, ImportForm)] {
             ("from", ImportForm::StringLiteral),
             ("import", ImportForm::StringLiteral),
         ],
-        Language::Rust => &[("use", ImportForm::BarePath)],
+        Language::Rust => &[("use", ImportForm::BarePath), ("mod", ImportForm::BarePath)],
         Language::Go => &[
             ("import", ImportForm::StringLiteral),
             ("require", ImportForm::StringLiteral),
@@ -729,8 +729,8 @@ const SINK_PATTERNS: &[SinkPattern] = &[
     SinkPattern { segments: &["spawn"], kind: SinkKind::CommandExec, only: None },
     SinkPattern { segments: &["spawnSync"], kind: SinkKind::CommandExec, only: None },
     SinkPattern { segments: &["Command::new"], kind: SinkKind::CommandExec, only: Some(Language::Rust) },
+    SinkPattern { segments: &["Command", "new"], kind: SinkKind::CommandExec, only: Some(Language::Rust) },
     SinkPattern { segments: &["std", "process", "Command"], kind: SinkKind::CommandExec, only: Some(Language::Rust) },
-    SinkPattern { segments: &["Command::new"], kind: SinkKind::CommandExec, only: None },
     SinkPattern { segments: &["exec", "Command"], kind: SinkKind::CommandExec, only: Some(Language::Go) },
 
     // --- Dynamic evaluation / reflection ---
@@ -782,8 +782,10 @@ const SINK_PATTERNS: &[SinkPattern] = &[
     SinkPattern { segments: &["os", "getenv"], kind: SinkKind::EnvAccess, only: Some(Language::Python) },
     SinkPattern { segments: &["environ"], kind: SinkKind::EnvAccess, only: Some(Language::Python) },
     SinkPattern { segments: &["process", "env"], kind: SinkKind::EnvAccess, only: None },
-    SinkPattern { segments: &["std::env"], kind: SinkKind::EnvAccess, only: Some(Language::Rust) },
-    SinkPattern { segments: &["env"], kind: SinkKind::EnvAccess, only: Some(Language::Go) },
+    SinkPattern { segments: &["std", "env", "var"], kind: SinkKind::EnvAccess, only: Some(Language::Rust) },
+    SinkPattern { segments: &["env", "var"], kind: SinkKind::EnvAccess, only: Some(Language::Rust) },
+    SinkPattern { segments: &["os", "Getenv"], kind: SinkKind::EnvAccess, only: Some(Language::Go) },
+    SinkPattern { segments: &["os", "LookupEnv"], kind: SinkKind::EnvAccess, only: Some(Language::Go) },
 
     // --- Network egress ---
     SinkPattern { segments: &["requests", "post"], kind: SinkKind::NetworkOutbound, only: Some(Language::Python) },
@@ -903,7 +905,12 @@ pub fn match_sink_resolved(
     aliases: &BTreeMap<String, String>,
 ) -> Option<SinkKind> {
     let expanded = expand_alias(callee, aliases);
-    let parts: Vec<&str> = expanded.split('.').filter(|p| !p.is_empty()).collect();
+    // Rust names its paths with `::`, so a Rust callee such as
+    // `std::process::Command::new` segments the same way `std.process.Command.new`
+    // would in every other language. Splitting both separators here keeps the
+    // pattern table language-agnostic.
+    let normalised = expanded.replace("::", ".");
+    let parts: Vec<&str> = normalised.split('.').filter(|p| !p.is_empty()).collect();
     if parts.is_empty() {
         return None;
     }
@@ -1868,6 +1875,22 @@ fn collect_expression_taint(
                     record_sink(out, kind, t.line, enclosing, &expr);
                     taint_out.insert(node_type_for(kind));
                 }
+                // Trailing-segment matching answers `os.environ` and
+                // `subprocess.run`; it cannot answer a *prefixed* chain such
+                // as `process.env.AWS_SECRET_ACCESS_KEY`, where the sink
+                // pattern (`process.env`) sits at the head and the accessed
+                // variable name (whatever the attacker wants) trails it.
+                // Every prefix of the chain is therefore tested too, so the
+                // sensitive-property read itself is the sink it observably is.
+                for depth in 2..segments.len() {
+                    let head = segments[..depth].join(".");
+                    if let Some(kind) = match_sink_resolved(&head, language, aliases) {
+                        let expr = render(tokens, i, j);
+                        record_sink(out, kind, t.line, enclosing, &expr);
+                        taint_out.insert(node_type_for(kind));
+                        break;
+                    }
+                }
                 // Environment / credential access is a taint source.
                 if joined.contains("environ") || joined == "process.env" || joined == "std::env" {
                     taint_out.insert(DtgNodeType::EnvSecret);
@@ -1955,14 +1978,22 @@ fn collect_expression_taint(
 
 /// Reconstructs a dotted callee ending at `idx`.
 fn callee_at(tokens: &[Token], idx: usize, end: usize) -> String {
-    // Walk back over `.ident` pairs to the root identifier.
+    // Walk back over `.ident` and `::ident` pairs to the root identifier.
+    // Rust writes `std::process::Command::new`, and stopping the walk on `::`
+    // reduced every Rust path call to its final segment -- `Command::new("sh")`
+    // resolved to the callee `new`, which matches no sink pattern. Keywords
+    // are accepted as segments too: `new` is a keyword, and it is the trailing
+    // segment of exactly that shape.
     let mut parts = Vec::new();
     let mut i = idx;
     loop {
         let Some(t) = tokens.get(i) else { break };
-        if t.kind == TokenKind::Identifier {
+        if matches!(t.kind, TokenKind::Identifier | TokenKind::Keyword) {
             parts.push(t.text.clone());
-            if i >= 2 && tokens[i - 1].text == "." && tokens[i - 2].kind == TokenKind::Identifier {
+            if i >= 2
+                && (tokens[i - 1].text == "." || tokens[i - 1].text == "::")
+                && tokens[i - 2].kind == TokenKind::Identifier
+            {
                 i -= 2;
                 continue;
             }

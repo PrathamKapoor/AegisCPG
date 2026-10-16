@@ -53,4 +53,6 @@ futures-core = "0.3"
 # always executed against the same graph shape the pipeline emits. The extractor
 # is a normal dependency above for the live sandbox; this section stays empty
 # unless a test needs something the library does not, and an empty section is
-# the honest state, not a stub.
+# the honest state, not a stub. The stdio-wrap transcript tests parse the
+# wrap's own JSON document, so the workspace pin carries over.
+serde_json.workspace = true

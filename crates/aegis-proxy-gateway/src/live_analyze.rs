@@ -19,11 +19,15 @@
 //! live path differs from its tested path is a claim nobody can check. So the
 //! live path *is* the tested path: the extractor, verifier, compiler, and VM
 //! called here are the same public functions the offline suites exercise, with
-//! no shortcut, no cache, and no model. The one thing deliberately absent is
-//! the ONNX semantic-divergence model: it lives in the offline Python pipeline
-//! (`ml-rag-engine/`), and the live path must not pretend to run it. Stage 2
-//! here is the deterministic replacement -- reachability diff, injection
-//! markers, sensitive literals, byte entropy -- and the response says so.
+//! no shortcut and no cache. The ONNX semantic-divergence model no longer lives
+//! only in the offline Python pipeline: the trained weights ship in a JSON
+//! manifest and, when it is loaded, Stage 2 scores the tool with the pure-Rust
+//! evaluator ([`crate::grpc_bridge::NativeManifestInvoker`]) — the engine the
+//! `aegis-cli parity` gate (ADR-024) proves produces the Python pipeline's own
+//! inputs and scores, bit for feature and ≤ 1e-6 per score. When the manifest
+//! is absent the response says so (`model_divergence` is `null`) and Stage 2
+//! reports the deterministic signals alone; an unavailable model is treated as
+//! *unreviewed*, never as benign.
 //!
 //! ## HOW
 //! Questions a reviewer will ask, answered in the open:
@@ -204,6 +208,10 @@ pub struct Stage2 {
     pub verdict: &'static str,
     /// Which signals fired, in words, so the verdict is auditable.
     pub rationale: String,
+    /// The trained divergence head's verdict, when the manifest is loaded:
+    /// the full native score record (score, auxiliary signals, latency, and
+    /// the manifest the score came from). `null` is *unreviewed*, not benign.
+    pub model_divergence: Option<crate::grpc_bridge::DivergenceResponse>,
 }
 
 /// One property's status in the Stage 3 report.
@@ -690,13 +698,15 @@ fn verdict_label(verdict: Verdict) -> &'static str {
 
 /// Runs all four stages over one request.
 ///
-/// Pure with respect to the process: everything it needs -- the signing issuer
-/// and the wall clock -- arrives as arguments, so the same request, issuer and
-/// timestamp always produce byte-identical output (the determinism test below
-/// pins that). Nothing is persisted; the DTG lives for the duration of the
-/// request and is returned to the caller, not added to the gateway's catalog.
+/// Pure with respect to the process: everything it needs -- the optional
+/// divergence bridge, the signing issuer and the wall clock -- arrives as
+/// arguments, so the same request, issuer and timestamp always produce
+/// byte-identical output (the determinism test below pins that). Nothing is
+/// persisted; the DTG lives for the duration of the request and is returned
+/// to the caller, not added to the gateway's catalog.
 pub fn analyze(
     request: &LiveAnalyzeRequest,
+    divergence: Option<&crate::grpc_bridge::GrpcBridge>,
     issuer: &PasetoIssuer,
     now_unix: u64,
 ) -> Result<LiveAnalyzeResponse, LiveAnalyzeError> {
@@ -886,6 +896,50 @@ pub fn analyze(
             sensitive_literals.join(", ")
         ));
     }
+
+    // --- Stage 2b: the trained divergence head, pure Rust (ADR-024). ---
+    //
+    // The native evaluator scores the graph the extractor produced against
+    // the joined declared descriptions: one tool lies and the server is
+    // compromised, so one pooled claim set is the honest input. The bridge
+    // caches by DTG hash and gates availability on the invoker being
+    // attached, so an absent manifest degrades to `unavailable`, never to a
+    // guessed score.
+    let model_divergence = divergence.map(|bridge| {
+        let joined_description = descriptions.join("\n");
+        let declared_named: Vec<String> =
+            declared.iter().map(|kind| kind.as_str().to_string()).collect();
+        bridge.evaluate(&crate::grpc_bridge::DivergenceRequest {
+            tool_id: server_id.clone(),
+            server_id: server_id.clone(),
+            declared_description: joined_description,
+            dtg: dtg.clone(),
+            declared_capabilities: declared_named,
+            model_loaded: bridge.is_available(),
+        })
+    });
+    if let Some(model) = &model_divergence {
+        if model.exceeds_threshold() {
+            reasons.push(format!(
+                "the trained divergence head scored {:.3} against the declared \
+                 intent (threshold 0.50)",
+                model.semantic_divergence_score
+            ));
+        }
+    }
+
+    // What the TACR vouches for. The contract's field is
+    // `semantic_divergence_score`, so when the trained head has actually
+    // scored this graph the TACR records *that* — two engines agree on the
+    // value, which is the whole point of the parity gate. The deterministic
+    // ratio remains the fallback for a headless run, and an unavailable
+    // score never reaches the contract: `None` means unreviewed.
+    let divergence_for_tacr = model_divergence
+        .as_ref()
+        .filter(|model| model.score_availability)
+        .map(|model| model.semantic_divergence_score)
+        .unwrap_or(divergence_ratio);
+
     let (verdict, rationale) = if reasons.is_empty() {
         (
             "consistent",
@@ -908,6 +962,7 @@ pub fn analyze(
         sensitive_literals,
         verdict,
         rationale,
+        model_divergence,
     };
     let stage2_us = stage2_started.elapsed().as_micros() as u64;
 
@@ -946,7 +1001,7 @@ pub fn analyze(
         server_id.clone(),
         LIVE_SERVER_VERSION.to_string(),
         dtg_sha256.clone(),
-        divergence_ratio,
+        divergence_for_tacr,
         label,
         synthesise_capabilities(&reached),
         CompositionPolicy::default(),
@@ -1395,7 +1450,7 @@ mod tests {
     }
 
     fn analyze_for_test(request: &LiveAnalyzeRequest) -> LiveAnalyzeResponse {
-        analyze(request, &issuer(), 1_760_000_000).expect("the request must analyze")
+        analyze(request, None, &issuer(), 1_760_000_000).expect("the request must analyze")
     }
 
     #[test]
@@ -1609,55 +1664,55 @@ mod tests {
     fn bad_requests_are_refused_with_the_fix_in_the_message() {
         let mut request = request("x = 1", "brainfuck");
         assert!(matches!(
-            analyze(&request, &issuer(), 1_760_000_000),
+            analyze(&request, None, &issuer(), 1_760_000_000),
             Err(LiveAnalyzeError::UnsupportedLanguage(_))
         ));
         request.language = "python".to_string();
         request.hook = Some("mmap".to_string());
         assert!(matches!(
-            analyze(&request, &issuer(), 1_760_000_000),
+            analyze(&request, None, &issuer(), 1_760_000_000),
             Err(LiveAnalyzeError::UnsupportedHook(_))
         ));
         request.hook = None;
         request.clearance = Some("COSMIC".to_string());
         assert!(matches!(
-            analyze(&request, &issuer(), 1_760_000_000),
+            analyze(&request, None, &issuer(), 1_760_000_000),
             Err(LiveAnalyzeError::UnsupportedClearance(_))
         ));
         request.clearance = None;
         request.hook = Some("socket".to_string());
         request.target = Some("collector.invalid".to_string());
         assert!(matches!(
-            analyze(&request, &issuer(), 1_760_000_000),
+            analyze(&request, None, &issuer(), 1_760_000_000),
             Err(LiveAnalyzeError::InvalidSocketTarget(_))
         ));
         request.hook = Some("file_open".to_string());
         request.target = Some("relative/path".to_string());
         assert!(matches!(
-            analyze(&request, &issuer(), 1_760_000_000),
+            analyze(&request, None, &issuer(), 1_760_000_000),
             Err(LiveAnalyzeError::InvalidFileTarget(_))
         ));
         request.target = None;
         request.source = "   ".to_string();
         assert!(matches!(
-            analyze(&request, &issuer(), 1_760_000_000),
+            analyze(&request, None, &issuer(), 1_760_000_000),
             Err(LiveAnalyzeError::EmptySource)
         ));
         request.source = "x = 1".to_string();
         request.server_id = Some("   ".to_string());
         assert!(matches!(
-            analyze(&request, &issuer(), 1_760_000_000),
+            analyze(&request, None, &issuer(), 1_760_000_000),
             Err(LiveAnalyzeError::InvalidServerId(_))
         ));
         request.server_id = Some("s".repeat(129));
         assert!(matches!(
-            analyze(&request, &issuer(), 1_760_000_000),
+            analyze(&request, None, &issuer(), 1_760_000_000),
             Err(LiveAnalyzeError::InvalidServerId(_))
         ));
         request.server_id = None;
         request.source = "x".repeat(MAX_SOURCE_BYTES + 1);
         assert!(matches!(
-            analyze(&request, &issuer(), 1_760_000_000),
+            analyze(&request, None, &issuer(), 1_760_000_000),
             Err(LiveAnalyzeError::SourceTooLarge { .. })
         ));
     }
@@ -1669,6 +1724,7 @@ mod tests {
         // different answers, and only one of them is honest.
         let error = analyze(
             &request("func main() { println(1) }", "go"),
+            None,
             &issuer(),
             1_760_000_000,
         )
@@ -1680,6 +1736,166 @@ mod tests {
             ),
             other => panic!("expected an extraction refusal, got {other:?}"),
         }
+    }
+
+    /// The native head over the manifest the ML pipeline ships, exactly as the
+    /// startup hook loads it. `CARGO_MANIFEST_DIR` pins the path so the test
+    /// finds the artifact regardless of the invoking shell's directory.
+    fn native_head() -> crate::grpc_bridge::GrpcBridge {
+        let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../ml-rag-engine/models/aegis_divergence_weights.json");
+        let head = crate::grpc_bridge::NativeManifestInvoker::load_from(&manifest_path)
+            .expect("the shipped divergence manifest must load inside the workspace");
+        assert!(
+            !head.model_sha256().is_empty(),
+            "the shipped manifest carries its own hash"
+        );
+        crate::grpc_bridge::GrpcBridge::with_invoker(std::sync::Arc::new(head))
+    }
+
+    #[test]
+    fn a_headless_analysis_says_unreviewed_not_benign() {
+        // Without the manifest the response must be honest about what is
+        // missing: the divergence verdict stays null and the deterministic
+        // signals carry the answer alone.
+        let response = analyze_for_test(&request(PRESETS[0].source, "javascript"));
+        assert!(response.stage2.model_divergence.is_none());
+        let json = serde_json::to_value(&response).unwrap();
+        assert!(
+            json["stage2"]["model_divergence"].is_null(),
+            "an absent head is null, not a zero score"
+        );
+    }
+
+    #[test]
+    fn the_native_head_agrees_with_the_python_reference_on_a_declared_tool() {
+        // PRESETS[4] is a fully-declared benign formatter. Its measured native
+        // score is pinned against the Python reference itself
+        // (`DivergenceModel.predict` through onnxruntime, measured 2026-10):
+        // 0.996642529964447 with cosine 0.7827122211456299, iou 1.0 and
+        // entropy 4.578638553619385. The training corpus's benign tools are
+        // pure computation, so a benign tool that *reaches a sink* is out of
+        // distribution and the head honestly reports high divergence — that is
+        // a property of the model, cross-engine, not of this port, and the
+        // response attributes the score to the head that produced it.
+        let bridge = native_head();
+        let mut request = request(PRESETS[4].source, "typescript");
+        request.hook = Some("file_open".to_string());
+        request.target = Some("/workspace/notes.md".to_string());
+        request.clearance = Some("CONFIDENTIAL".to_string());
+        let response =
+            analyze(&request, Some(&bridge), &issuer(), 1_760_000_000).expect("must analyze");
+        let model = response
+            .stage2
+            .model_divergence
+            .as_ref()
+            .expect("the head is attached, so stage 2 carries its score");
+        assert!(model.score_availability, "the head was resident");
+        let python_score = 0.996642529964447_f64;
+        assert!(
+            (model.semantic_divergence_score - python_score).abs() < 1e-6,
+            "native {} vs python {python_score}",
+            model.semantic_divergence_score
+        );
+        assert_eq!(model.gbdt_score, model.semantic_divergence_score);
+        assert!(
+            (model.description_cosine_distance - 0.7827122211456299).abs() < 1e-6,
+            "cosine {}",
+            model.description_cosine_distance
+        );
+        assert!((model.capability_iou - 1.0).abs() < 1e-6);
+        assert!(
+            (model.shannon_entropy - 4.578638553619385).abs() < 1e-6,
+            "entropy {}",
+            model.shannon_entropy
+        );
+        assert_eq!(
+            model
+                .reached_sinks
+                .iter()
+                .map(|kind| kind.as_str().to_string())
+                .collect::<Vec<_>>(),
+            vec!["FileRead".to_string()]
+        );
+        assert_eq!(model.cyclomatic_complexity, 1);
+        // The fold: a headless run keeps the deterministic verdict, an
+        // attached head above the threshold adds its reason to the rationale —
+        // same request, and the difference is the model and nothing else.
+        let headless =
+            analyze(&request, None, &issuer(), 1_760_000_000).expect("must analyze");
+        assert_eq!(headless.stage2.verdict, "consistent");
+        assert_eq!(
+            response.stage2.verdict, "flagged",
+            "the model's fold: {}",
+            response.stage2.rationale
+        );
+        assert!(response.stage2.rationale.contains("divergence head"));
+        // The TACR is a signed artifact about THIS graph, so it records what
+        // the head scored, not the fallback ratio; the headless run keeps the
+        // ratio and nothing else.
+        assert!(
+            (response.stage3.tacr.semantic_divergence_score - python_score).abs() < 1e-6,
+            "the TACR records the scored divergence: {}",
+            response.stage3.tacr.semantic_divergence_score
+        );
+        assert_eq!(headless.stage3.tacr.semantic_divergence_score, 0.0);
+    }
+
+    #[test]
+    fn the_native_head_folds_its_score_into_the_verdict_for_the_undeclared_exec() {
+        // PRESETS[0] registers a tool named `format_date` whose description
+        // promises date formatting while the graph executes a command string
+        // chain: cosine 0.981, capability overlap 0. The Python reference
+        // scores 0.7501974105834961, above the 0.50 fold threshold.
+        let bridge = native_head();
+        let mut request = request(PRESETS[0].source, "javascript");
+        request.clearance = Some("CONFIDENTIAL".to_string());
+        request.hook = Some("bprm".to_string());
+        request.target = Some("/bin/sh".to_string());
+        let response =
+            analyze(&request, Some(&bridge), &issuer(), 1_760_000_000).expect("must analyze");
+        let model = response
+            .stage2
+            .model_divergence
+            .as_ref()
+            .expect("the head is attached");
+        let python_score = 0.7501974105834961_f64;
+        assert!(
+            (model.semantic_divergence_score - python_score).abs() < 1e-6,
+            "native {} vs python {python_score}",
+            model.semantic_divergence_score
+        );
+        assert!((model.capability_iou - 0.0).abs() < 1e-6);
+        assert!(
+            (model.description_cosine_distance - 0.981421947479248).abs() < 1e-6,
+            "cosine {}",
+            model.description_cosine_distance
+        );
+        assert_eq!(response.stage2.verdict, "flagged");
+        assert!(
+            response.stage2.rationale.contains("divergence head scored"),
+            "the fold names its source: {}",
+            response.stage2.rationale
+        );
+    }
+
+    #[test]
+    fn the_native_head_is_deterministic_through_the_cache() {
+        let bridge = native_head();
+        let mut request = request(PRESETS[0].source, "javascript");
+        request.clearance = Some("CONFIDENTIAL".to_string());
+        request.hook = Some("bprm".to_string());
+        request.target = Some("/bin/sh".to_string());
+        let first =
+            analyze(&request, Some(&bridge), &issuer(), 1_760_000_000).expect("must analyze");
+        let second =
+            analyze(&request, Some(&bridge), &issuer(), 1_760_000_000).expect("must analyze");
+        let m1 = serde_json::to_value(first.stage2.model_divergence.as_ref().unwrap()).unwrap();
+        let m2 = serde_json::to_value(second.stage2.model_divergence.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            m1, m2,
+            "the same graph through the same head is one answer, timings included"
+        );
     }
 
     #[test]

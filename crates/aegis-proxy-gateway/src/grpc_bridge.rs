@@ -8,10 +8,13 @@
 //! `specs/proto/aegis.proto`, implemented against plain Rust types.
 //!
 //! ## WHY
-//! Stage 2 (the GAT/GBDT classifier) lives in Python and the hot path lives in
-//! Rust. Without a typed contract the two drift: the Python model adds a
-//! feature, the Rust gateway keeps reading the old struct, and the divergence
-//! score silently stops being enforced.
+//! Stage 2 (the GAT/GBDT classifier) was trained in Python and the hot path
+//! lives in Rust. Without a typed contract the two drift: the Python model adds
+//! a feature, the Rust gateway keeps reading the old struct, and the divergence
+//! score silently stops being enforced. Since ADR-024 the trained weights ship
+//! in a JSON manifest and this crate can run the model *itself* — no Python
+//! runtime, no gRPC hop — through [`NativeManifestInvoker`], which is what
+//! `POST /api/live-analyze` scores with when the manifest is present.
 //!
 //! ## HOW
 //! These are hand-written equivalents of the generated code rather than the
@@ -266,6 +269,188 @@ impl GrpcBridge {
     }
 }
 
+/// Where the shipped divergence manifest lives, relative to the repository
+/// root. The gateway resolves it against the working directory and each parent
+/// up to four levels, so running the binary from the repo root, from a crate
+/// directory, or from a subdirectory all land on the same artifact.
+pub const DEFAULT_MANIFEST_PATH: &str = "ml-rag-engine/models/aegis_divergence_weights.json";
+
+/// The environment variable that overrides the default manifest location.
+pub const MANIFEST_ENV_VAR: &str = "AEGIS_DIVERGENCE_MANIFEST";
+
+/// The pure-Rust divergence head: the trained weights plus the native
+/// featurization (`aegis-common`'s onnx_parity_scorer and
+/// divergence_features), no Python runtime and no gRPC hop.
+///
+/// This is the [`ModelInvoker`] the gateway attaches when
+/// [`NativeManifestInvoker::load`] finds the shipped manifest. The parity gate
+/// (`aegis-cli parity`, ADR-024) is what makes attaching it sound: the gate
+/// measures, against the Python pipeline itself, that the featurized inputs
+/// and the scores this code produces are the ones the model was trained on
+/// (ADR-024).
+pub struct NativeManifestInvoker {
+    manifest: aegis_common::onnx_parity_scorer::WeightsManifest,
+    load_path: std::path::PathBuf,
+}
+
+impl std::fmt::Debug for NativeManifestInvoker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeManifestInvoker")
+            .field("model_sha256", &self.manifest.model_sha256)
+            .field("load_path", &self.load_path)
+            .finish()
+    }
+}
+
+impl NativeManifestInvoker {
+    /// A head over an already-parsed manifest.
+    pub fn from_manifest(
+        manifest: aegis_common::onnx_parity_scorer::WeightsManifest,
+        load_path: std::path::PathBuf,
+    ) -> Self {
+        NativeManifestInvoker { manifest, load_path }
+    }
+
+    /// Loads the shipped manifest: `AEGIS_DIVERGENCE_MANIFEST` when set, else
+    /// `DEFAULT_MANIFEST_PATH` resolved against the working directory and up
+    /// to four parents. `None` when nothing parses — the caller runs without
+    /// a model head, exactly as if the ML service were down.
+    pub fn load() -> Option<Self> {
+        match std::env::var(MANIFEST_ENV_VAR) {
+            Ok(path) => NativeManifestInvoker::load_from(std::path::Path::new(&path)),
+            Err(_) => NativeManifestInvoker::load_from_default(),
+        }
+    }
+
+    /// The default-path search: the working directory itself, then up to four
+    /// parents (the depth of a crate directory inside this workspace).
+    fn load_from_default() -> Option<Self> {
+        let cwd = std::env::current_dir().ok()?;
+        let mut candidate = cwd.as_path();
+        for _ in 0..5 {
+            let path = candidate.join(DEFAULT_MANIFEST_PATH);
+            if let Some(head) = NativeManifestInvoker::load_from(&path) {
+                return Some(head);
+            }
+            candidate = candidate.parent()?;
+        }
+        None
+    }
+
+    /// Parses the manifest at `path`; `None` on a missing or malformed file.
+    pub fn load_from(path: &std::path::Path) -> Option<Self> {
+        let bytes = std::fs::read(path).ok()?;
+        let manifest = aegis_common::onnx_parity_scorer::WeightsManifest::parse(&bytes).ok()?;
+        Some(NativeManifestInvoker::from_manifest(manifest, path.to_path_buf()))
+    }
+
+    /// The manifest this head scores with.
+    pub fn model_sha256(&self) -> &str {
+        &self.manifest.model_sha256
+    }
+
+    /// Where the manifest was read from.
+    pub fn load_path(&self) -> &std::path::Path {
+        &self.load_path
+    }
+}
+
+impl ModelInvoker for NativeManifestInvoker {
+    /// Scores one tool with the trained weights, entirely in process.
+    ///
+    /// Every internal failure is fail-closed: a malformed graph or a shape
+    /// mismatch yields [`DivergenceResponse::unavailable`], never a guessed
+    /// score. `model_sha256` is always reported so a consumer can tell which
+    /// artifact produced even an unavailable answer.
+    fn evaluate(&self, request: &DivergenceRequest) -> DivergenceResponse {
+        let started = std::time::Instant::now();
+        let fused = match aegis_common::divergence_features::fused_features(
+            &self.manifest,
+            &request.dtg,
+            &request.declared_description,
+        ) {
+            Ok((graph, fused)) => (graph, fused),
+            Err(_) => {
+                let mut unavailable = DivergenceResponse::unavailable();
+                unavailable.model_sha256 = self.manifest.model_sha256.clone();
+                return unavailable;
+            }
+        };
+        let (graph, fused) = fused;
+        let logit = aegis_common::onnx_parity_scorer::gbdt_logit(&self.manifest, &fused);
+        let score = aegis_common::onnx_parity_scorer::sigmoid(logit);
+
+        // Auxiliary signals, in the shape the proto defines: the pooled
+        // embedding's magnitude squashed through the training report's tanh
+        // scale, the description's cosine distance from the realised-sink
+        // text, and the capability overlap the description claims versus what
+        // the graph reaches.
+        let embedding = &fused[..self.manifest.out_dim];
+        let norm: f64 = embedding
+            .iter()
+            .map(|v| f64::from(*v) * f64::from(*v))
+            .sum::<f64>()
+            .sqrt();
+        let gat_score = (norm / 4.0).tanh();
+
+        let description_vec = aegis_common::divergence_features::encode(&request.declared_description);
+        let sink_kinds: Vec<String> = graph.sink_kinds.iter().cloned().collect();
+        let sink_vec = aegis_common::divergence_features::encode(&sink_kinds.join(" "));
+        let cosine = if sink_kinds.is_empty() {
+            1.0
+        } else {
+            aegis_common::divergence_features::cosine_distance(&description_vec, &sink_vec)
+        };
+
+        let declared_caps = aegis_common::divergence_features::declared_capabilities(
+            &request.declared_description,
+        );
+        let declared_ref: std::collections::BTreeSet<&str> = declared_caps.iter().copied().collect();
+        let reached_ref: std::collections::BTreeSet<&str> = graph
+            .sink_kinds
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let iou = if declared_ref.is_empty() && reached_ref.is_empty() {
+            1.0
+        } else {
+            let inter = declared_ref.intersection(&reached_ref).count();
+            let union = declared_ref.union(&reached_ref).count();
+            inter as f64 / union as f64
+        };
+
+        DivergenceResponse {
+            score_availability: true,
+            semantic_divergence_score: f64::from(score),
+            gat_score,
+            // The manifest head emits one post-fusion score; the proto's
+            // gbdt field carries the same value because the fused trees are
+            // the branch that decides.
+            gbdt_score: f64::from(score),
+            description_cosine_distance: cosine,
+            capability_iou: iou,
+            shannon_entropy: aegis_common::divergence_features::max_sink_entropy(
+                &request.dtg.detected_sinks,
+            ),
+            // The compressed DTG carries no branch count; the native head
+            // records the single-path baseline rather than a fabricated
+            // estimate. The field is proto shape, not a policy input.
+            cyclomatic_complexity: 1,
+            reached_sinks: {
+                let mut sinks: Vec<SinkKind> = graph
+                    .sink_kinds
+                    .iter()
+                    .map(|kind| SinkKind::from_str_name(kind).expect("kinds come from the enum"))
+                    .collect();
+                sinks.sort();
+                sinks
+            },
+            inference_ms: started.elapsed().as_secs_f64() * 1e3,
+            model_sha256: self.manifest.model_sha256.clone(),
+        }
+    }
+}
+
 /// Asserts that every field and method this bridge implements still appears in
 /// `specs/proto/aegis.proto`.
 ///
@@ -460,6 +645,99 @@ mod tests {
         assert_eq!(b.cache_len(), 0);
         b.evaluate(&request());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// The manifest the ML pipeline ships, at the workspace-standard path.
+    fn shipped_manifest_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../ml-rag-engine/models/aegis_divergence_weights.json")
+    }
+
+    #[test]
+    fn the_native_head_loads_the_shipped_manifest() {
+        let head = NativeManifestInvoker::load_from(&shipped_manifest_path())
+            .expect("the shipped manifest parses");
+        assert!(
+            !head.model_sha256().is_empty(),
+            "the manifest carries its own content hash"
+        );
+        assert!(
+            head.load_path()
+                .ends_with("ml-rag-engine/models/aegis_divergence_weights.json"),
+            "the head remembers where it loaded from, for the startup log"
+        );
+    }
+
+    #[test]
+    fn a_missing_manifest_degrades_to_no_head_not_a_default() {
+        // Silence is not permission: a head that cannot load must be absent,
+        // so callers see an unavailable score instead of a fabricated one.
+        let missing =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("no/such/manifest.json");
+        assert!(NativeManifestInvoker::load_from(&missing).is_none());
+    }
+
+    #[test]
+    fn the_native_head_scores_a_real_graph_in_process() {
+        let head = NativeManifestInvoker::load_from(&shipped_manifest_path()).unwrap();
+        let response = head.evaluate(&request());
+        assert!(response.score_availability);
+        assert!(
+            (0.0..=1.0).contains(&response.semantic_divergence_score),
+            "{}",
+            response.semantic_divergence_score
+        );
+        assert_eq!(
+            response.model_sha256,
+            head.model_sha256().to_string(),
+            "the answer names the artifact that produced it"
+        );
+        // The empty-graph test fixture reaches no sinks: the score comes from
+        // the trained trees on the fallback row, and the sink signals are the
+        // degenerate values the Python reference produces for the same shape.
+        assert!(response.reached_sinks.is_empty());
+        assert_eq!(
+            response.gbdt_score, response.semantic_divergence_score,
+            "the manifest head emits one post-fusion score"
+        );
+        assert!(
+            (0.0..=1.0).contains(&response.gat_score),
+            "the pooled embedding's tanh scale: {}",
+            response.gat_score
+        );
+        assert!(response.inference_ms > 0.0, "the head measures its own latency");
+    }
+
+    #[test]
+    fn an_incompatible_manifest_scores_unavailable_and_names_the_artifact() {
+        // A manifest whose input dimension does not match the featurized row
+        // cannot be scored: the featurizer refuses the shape and the head
+        // answers unavailable with its identity attached, rather than a
+        // guessed score or a panic from indexing past the row.
+        let shipped_bytes = std::fs::read(shipped_manifest_path()).unwrap();
+        let expected_sha = {
+            let head = NativeManifestInvoker::load_from(&shipped_manifest_path())
+                .expect("the shipped manifest parses");
+            head.model_sha256().to_string()
+        };
+        let mut manifest = aegis_common::onnx_parity_scorer::WeightsManifest::parse(&shipped_bytes)
+            .expect("the shipped manifest is well-formed");
+        manifest.in_dim = 22; // the featurizer emits 21-wide rows
+        let wrong_head = NativeManifestInvoker::from_manifest(manifest, shipped_manifest_path());
+        let refused = wrong_head.evaluate(&request());
+        assert!(!refused.score_availability, "a shape mismatch must not score");
+        assert!(
+            !refused.exceeds_threshold(),
+            "an unavailable score never trips the threshold"
+        );
+        assert_eq!(
+            refused.semantic_divergence_score, 0.0,
+            "no guessed value along the refusal"
+        );
+        assert_eq!(
+            refused.model_sha256, expected_sha,
+            "the refusal still names the artifact"
+        );
     }
 
     #[test]

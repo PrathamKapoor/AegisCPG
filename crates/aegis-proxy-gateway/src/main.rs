@@ -37,6 +37,24 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Diagnostic modes run before any server work and never bind: the
+    // self-check is what an operator runs to prove the audit ledger catches
+    // its own tamper, in the same binary that enforces with it.
+    if args.first().map(String::as_str) == Some("--ledger-selfcheck") {
+        let exit = ledger_selfcheck();
+        std::process::exit(exit);
+    }
+    if args.first().map(String::as_str) == Some("--stdio-wrap") {
+        let grants: std::collections::BTreeMap<String, ToolGrant> =
+            load_grants_from_environment()
+                .into_iter()
+                .map(|g| (g.tool_id.clone(), g))
+                .collect();
+        let exit = aegis_proxy_gateway::stdio_bridge::run_stdio_wrap(&args[1..], &grants);
+        std::process::exit(exit);
+    }
+
     if !BIND_ADDRESS.starts_with("127.0.0.1:") && !BIND_ADDRESS.starts_with("[::1]:") {
         eprintln!(
             "refusing to bind {BIND_ADDRESS}: the gateway exposes the capability \
@@ -60,6 +78,33 @@ async fn main() {
     load_fido2_credentials_from_environment(&mut state);
     load_oauth_clients_from_environment(&mut state);
     state.set_paseto_issuer(load_paseto_issuer());
+
+    // The trained divergence head, when its manifest is reachable: ADR-024's
+    // native evaluator, loaded once at startup. Its absence is logged, not
+    // hidden -- the live analyzer answers with `model_divergence: null` and
+    // the deterministic signals alone, which is an honest degradation.
+    match aegis_proxy_gateway::grpc_bridge::NativeManifestInvoker::load() {
+        Some(invoker) => {
+            println!(
+                "divergence head: sha256={} manifest={}",
+                invoker.model_sha256(),
+                invoker.load_path().display()
+            );
+            state.attach_divergence(std::sync::Arc::new(
+                aegis_proxy_gateway::grpc_bridge::GrpcBridge::with_invoker(std::sync::Arc::new(
+                    invoker,
+                )),
+            ));
+        }
+        None => {
+            eprintln!(
+                "divergence head: not loaded (set {} or ship {}); live analysis runs \
+                 without a model score",
+                aegis_proxy_gateway::grpc_bridge::MANIFEST_ENV_VAR,
+                aegis_proxy_gateway::grpc_bridge::DEFAULT_MANIFEST_PATH
+            );
+        }
+    }
 
     let (rp_id, rp_origin) = state.with_fido2(|v| {
         let rp = v.relying_party();
@@ -90,6 +135,23 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// `--ledger-selfcheck`: proves, in the enforcing binary, that the audit
+/// ledger catches its own tamper. The mechanics live in
+/// [`aegis_proxy_gateway::audit_ledger::selfcheck`], next to the chain they
+/// exercise; this wrapper owns the exit code and the operator-facing output.
+fn ledger_selfcheck() -> i32 {
+    match aegis_proxy_gateway::audit_ledger::selfcheck() {
+        Ok(()) => {
+            println!("ledger selfcheck: PASS — the tampered record was named (seq 2)");
+            0
+        }
+        Err(reason) => {
+            eprintln!("selfcheck failed: {reason}");
+            1
+        }
+    }
 }
 
 /// Loads attested grants from the environment.

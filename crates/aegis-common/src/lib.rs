@@ -33,7 +33,10 @@
 //! the build if a generative dependency is ever added to the control plane.
 
 pub mod crypto;
+pub mod divergence_features;
 pub mod lattice;
+pub mod onnx_parity_scorer;
+pub mod sarif;
 pub mod tacr;
 pub mod types;
 
@@ -55,6 +58,11 @@ pub const AEGIS_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Product name as it appears in CEF records and the gateway banner.
 pub const AEGIS_PRODUCT: &str = "AegisCPG";
+
+/// The sole author, as every signed and audited artifact attributes it:
+/// TACRs, parity reports, ledger documents, and the final audit all read
+/// this one constant rather than restating the string.
+pub const AEGIS_AUTHOR: &str = "Pratham Kapoor <prathamkapoor027@gmail.com>";
 
 #[cfg(test)]
 mod integration_tests {

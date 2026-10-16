@@ -40,6 +40,7 @@
 //! * [`http`] -- the Axum surface, bound to loopback only.
 
 pub mod assets;
+pub mod audit_ledger;
 pub mod auth_fido2;
 pub mod cypher;
 pub mod edit_automaton;
@@ -50,6 +51,7 @@ pub mod metrics;
 pub mod oauth;
 pub mod paseto;
 pub mod random;
+pub mod stdio_bridge;
 pub mod taint_tracker;
 
 pub use edit_automaton::{

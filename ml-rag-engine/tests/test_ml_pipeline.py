@@ -49,6 +49,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_DIR = REPO_ROOT / "benchmarks" / "fixtures" / "vulnerable-lab"
 
 VULNERABLE_FIXTURES = (
+    "go_reverse_shell_sink.go",
     "js_indirect_prompt_inj.js",
     "js_indirect_prompt_rmt.js",
     "js_malicious_code_exec.js",
@@ -57,7 +58,10 @@ VULNERABLE_FIXTURES = (
     "js_outdated_packages.js",
     "js_secrets_pii.js",
     "py_filesystem_workspace.py",
+    "py_multifile_split_exfil.py",
     "py_wikipedia_streamable.py",
+    "rs_unsafe_command_exec.rs",
+    "ts_ssrf_metadata_exfil.ts",
 )
 
 BENIGN_FIXTURES = (
@@ -492,12 +496,77 @@ def test_training_is_deterministic(model) -> None:
 # ---------------------------------------------------------------------------
 @requires_cli
 def test_recall_and_false_positive_rate(scores: dict[str, float]) -> None:
-    """9/9 recall and 0/5 false positives, measured, not asserted in prose."""
+    """13/13 recall and 0/5 false positives, measured, not asserted in prose."""
     recall = sum(1 for n in VULNERABLE_FIXTURES if scores[n] >= DIVERGENCE_THRESHOLD)
     false_positives = sum(1 for n in BENIGN_FIXTURES if scores[n] >= DIVERGENCE_THRESHOLD)
     detail = ", ".join(f"{n}={scores[n]:.4f}" for n in sorted(scores))
-    assert recall == len(VULNERABLE_FIXTURES), f"recall {recall}/9: {detail}"
+    assert recall == len(VULNERABLE_FIXTURES), f"recall {recall}/13: {detail}"
     assert false_positives == 0, f"{false_positives}/5 benign flagged: {detail}"
+
+
+@requires_cli
+def test_rust_scorer_matches_onnxruntime_to_six_decimals(model, scans) -> None:
+    """The pure-Rust evaluator scores exactly what the ONNX graph scores.
+
+    AegisCPG keeps two engines for the divergence head: Python/onnxruntime and
+    `crates/aegis-common/src/onnx_parity_scorer.rs`, which re-executes the
+    trained arithmetic so the gateway and CLI never need a Python runtime to
+    score a tool. Two engines sharing only weights drift silently, so this
+    test makes the claim falsifiable (ADR-024): the exact node features, the
+    adjacency, and the tabular features of every shipped fixture plus 100
+    seeded synthetic probes are handed to `aegis-cli parity`, which runs the
+    manifest's weights in pure Rust and reports the maximum absolute
+    difference against onnxruntime's answers. 1e-6 is the bound: well below
+    any threshold decision, tight enough to catch a reordered summation.
+    """
+    from aegis_ml.gat_divergence import WEIGHTS_MANIFEST_PATH
+    from aegis_ml.parity_handoff import build_parity_inputs
+    from aegis_ml.training_corpus import CACHE_ROOT
+
+    manifest_path = model.export_weights_manifest()
+    assert (
+        manifest_path == WEIGHTS_MANIFEST_PATH and manifest_path.exists()
+    ), "the parity manifest belongs in ml-rag-engine/models"
+    assert manifest_path.read_text(encoding="utf-8").count('"feature"') == len(
+        model.classifier.estimators_
+    ), "one exported tree per boosting iteration"
+
+    inputs_path = CACHE_ROOT / "parity_inputs.json"
+    build_parity_inputs(
+        model,
+        {name: server["dtg"] for name, server in scans.items()},
+        inputs_path,
+    )
+
+    completed = subprocess.run(
+        [str(CLI), "parity", "--manifest", str(manifest_path), "--inputs", str(inputs_path)],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert completed.returncode == 0, f"parity gate failed: {completed.stdout}\n{completed.stderr}"
+    report = json.loads(completed.stdout)
+    assert report["case_count"] == len(scans) + 100
+    assert report["fixture_cases"] == len(scans)
+    assert report["synthetic_probes"] == 100
+    assert report["within_bound"] is True, report["failures"]
+    assert report["max_abs_diff"] < 1e-6, report
+    assert report["manifest_model_sha256"] == model.model_sha256, (
+        "the parity document was built against a different ONNX artifact than "
+        "the manifest describes"
+    )
+
+    # The second, deeper half of the gate: fixture cases carry the raw DTG
+    # they were featurised from, and the Rust side re-derives its features
+    # from that graph — the exact inputs derivation the live endpoint runs.
+    # The derived numbers must reload to the Python pipeline's own matrices,
+    # which is what makes `POST /api/live-analyze`'s native model head
+    # trustworthy without a Python runtime (ADR-024).
+    assert report["derived_cases"] == len(scans), report["derived_failures"]
+    assert report["derived_feature_diff"] < 1e-6, report["derived_failures"]
+    assert report["derived_adjacency_diff"] < 1e-6, report["derived_failures"]
+    assert report["derived_tabular_diff"] < 1e-6, report["derived_failures"]
+    assert report["derived_score_diff"] < 1e-6, report["derived_failures"]
 
 
 @requires_cli

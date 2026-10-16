@@ -70,6 +70,11 @@ except Exception:  # pragma: no cover
 
 MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
 MODEL_PATH = MODEL_DIR / "aegis_divergence.onnx"
+#: The Rust-parity manifest. `crates/aegis-common/src/onnx_parity_scorer.rs`
+#: loads exactly this file and reproduces the trained arithmetic; the pytest
+#: parity gate asserts the two backends agree to 1e-6 over every fixture and
+#: synthetic probe (ADR-024).
+WEIGHTS_MANIFEST_PATH = MODEL_DIR / "aegis_divergence_weights.json"
 
 N_HEADS = 4
 HIDDEN_DIM = 16
@@ -530,9 +535,18 @@ def tabular_features(
     max_chunk_entropy: float,
     egress_present: float = 0.0,
 ) -> np.ndarray:
-    """The nine semantic features consumed by the tree branch."""
+    """The nine semantic features consumed by the tree branch.
+
+    `capability_mismatch_count` is the |declared XOR realised| count divided
+    by four and clamped to ``[0, 1]``. Every caller -- training, the synthetic
+    fallback, and live inference -- must see the same normalisation: an
+    earlier version fed the raw count at training time and the clamped ratio
+    at serve time, so the tree had learned a split on a scale its production
+    inputs never visited. Keeping the division in this one function is what
+    makes the scales match by construction.
+    """
     declared = declared_capabilities(description)
-    mismatch = len(declared.symmetric_difference(graph.sink_kinds))
+    mismatch = min(1.0, len(declared.symmetric_difference(graph.sink_kinds)) / 4.0)
 
     return np.asarray(
         [
@@ -723,7 +737,9 @@ def _make_sample(
     cos = cosine_distance(declared_vec, sink_vec)
     declared = declared_capabilities(description)
     realised = set() if sink_entry == "none" else {sink_entry}
-    mismatch = len(declared.symmetric_difference(realised))
+    # Same normalisation as `tabular_features`: |declared XOR realised| / 4,
+    # clamped to [0, 1]. Training and serving must divide the same way.
+    mismatch = min(1.0, len(declared.symmetric_difference(realised)) / 4.0)
 
     max_lattice = 3 if sink_entry in HIGH_RISK_SINKS else (1 if realised else 0)
     min_hop = 1 if sink_entry != "none" else 3
@@ -1259,10 +1275,75 @@ class DivergenceModel:
         self.model_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
         return True
 
+    def weights_manifest(self) -> dict:
+        """The exact trained weights, serialisable to JSON.
+
+        This is not a summary: every number the Rust evaluator consumes is
+        here, at the full precision the export had. Tree thresholds are
+        exported as float32-rounded values because the ONNX graph (and
+        therefore the shipped serving path) compares in float32 -- the Rust
+        mirror compares in float32 against these same thresholds, which is
+        what makes its leaf decisions identical rather than close.
+        """
+        if self.classifier is None:
+            raise RuntimeError("train() must be called before reading the weights")
+
+        trees = []
+        for estimator in self.classifier.estimators_[:, 0]:
+            tree = estimator.tree_
+            trees.append(
+                {
+                    "feature": [int(x) for x in tree.feature],
+                    "threshold": [float(np.float32(x)) for x in tree.threshold],
+                    "children_left": [int(x) for x in tree.children_left],
+                    "children_right": [int(x) for x in tree.children_right],
+                    "value": [float(x) for x in tree.value[:, 0, 0]],
+                }
+            )
+
+        return {
+            "schema": "aegis.divergence_weights.v1",
+            "author": "Pratham Kapoor <prathamkapoor027@gmail.com>",
+            "product": "AegisCPG",
+            "model_sha256": self.model_sha256,
+            "n_heads": int(N_HEADS),
+            "hidden_dim": int(HIDDEN_DIM),
+            "out_dim": int(GAT_EMBED_DIM),
+            "in_dim": int(INPUT_FEATURE_DIM),
+            "alpha_slope": float(self.gat.alpha_slope),
+            "W": self.gat.W.tolist(),
+            "a_src": self.gat.a_src.tolist(),
+            "a_dst": self.gat.a_dst.tolist(),
+            "W_out": self.gat.W_out.tolist(),
+            "learning_rate": float(self.classifier.learning_rate),
+            "base_log_odds": binary_init_score(
+                self.classifier, np.asarray(self.metrics.get("labels", [0, 1]))
+            ),
+            "n_estimators": int(len(self.classifier.estimators_)),
+            "n_tabular": int(N_TABULAR),
+            "n_graph_embed": int(GAT_EMBED_DIM),
+            "trees": trees,
+        }
+
+    def export_weights_manifest(self, path: Path | None = None) -> Path:
+        """Write [`weights_manifest`] to the shipped models directory."""
+        target = Path(path) if path is not None else WEIGHTS_MANIFEST_PATH
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(self.weights_manifest(), indent=2) + "\n")
+        return target
+
     # -- inference ----------------------------------------------------------
 
-    def features_for(self, dtg: dict, description: str, description_vec: np.ndarray) -> tuple[np.ndarray, ToolGraph, np.ndarray]:
-        """Build the 24-d feature vector for one tool's DTG."""
+    def features_for(
+        self, dtg: dict, description: str, description_vec: np.ndarray
+    ) -> tuple[np.ndarray, ToolGraph, np.ndarray]:
+        """Build the 41-d feature vector for one tool's DTG.
+
+        The layout is the 32-d GAT embedding concatenated with the 9 semantic
+        tabular features. All tabular normalisations live inside
+        [`tabular_features`]; this function must not re-scale anything after
+        the fact, or the training and serving distributions drift apart again.
+        """
         max_entropy = 0.0
         for sink in dtg.get("detected_sinks", []):
             expr = sink.get("expression", "") or ""
@@ -1288,7 +1369,6 @@ class DivergenceModel:
             if (declared | graph.sink_kinds)
             else 1.0
         )
-        mismatch = len(declared.symmetric_difference(graph.sink_kinds)) / 4.0
         schema_mut = float(dtg.get("schema_mutability", 0.25))
         # Injection markers count from two places. The second is the one that
         # matters for the indirect-injection class: Stage 1 scans the server's
@@ -1304,7 +1384,6 @@ class DivergenceModel:
             description, graph, description_vec, sink_vec,
             schema_mut, typosquat, injection, max_entropy, egress,
         )
-        tabular[1] = min(1.0, mismatch)
 
         features = np.concatenate([gat_embedding, tabular]).astype(np.float32)
         return features, graph, alphas

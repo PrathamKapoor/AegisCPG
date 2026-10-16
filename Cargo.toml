@@ -70,8 +70,13 @@ aegis-proxy-gateway = { path = "crates/aegis-proxy-gateway", version = "1.0.0" }
 aegis-desktop-core = { path = "crates/aegis-desktop-core", version = "1.0.0" }
 
 # --- Serialisation ----------------------------------------------------------
+# `float_roundtrip` makes the JSON float parser correctly rounded (Lemire's
+# algorithm + fallback). Without it the fast path is off by up to one f64 ulp
+# on 17-digit literals, which the parity gate's 1e-6 bound would still forgive
+# but a canonical-hash check could not: a verifier that re-parses a document
+# must read back the exact f64 the signer hashed.
 serde = { version = "1.0", features = ["derive"] }
-serde_json = { version = "1.0", features = ["preserve_order"] }
+serde_json = { version = "1.0", features = ["preserve_order", "float_roundtrip"] }
 
 # --- Hashing / signatures ---------------------------------------------------
 sha2 = "0.10"

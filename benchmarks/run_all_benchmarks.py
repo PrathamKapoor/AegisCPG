@@ -4,20 +4,26 @@ Every number in this repository's design documents was, until now, written by
 hand. This harness exists so that none of them has to be.
 
 WHAT
-    Runs the compiled `aegis-cli.exe` over the 14 shipped fixtures and the 50
-    compositional exfiltration chains, runs the real divergence model and the
-    real retriever over the results, model-checks the shipped TLA+ specification
-    through `aegis-cli check-tla`, drives the real eBPF three-way equivalence
-    gate (the freestanding C hooks, the Rust simulator, the RFC 9669 VM) over
-    its 24-case table, and folds in the Phase 9 verification artefacts: the
-    1,000-case three-way differential fuzz and the algebraic-properties guard
-    agreement, both read back from the summaries their `cargo test` targets
-    seal rather than re-run here. The measurements go to three formats: DuckDB,
-    Parquet, and a JSON summary. Eight tables are written; the TLA+, eBPF and
-    differential-fuzz tables get their own Parquet files beside the union one,
-    and the algebraic-properties report -- a fixed three-row suite summary
-    rather than measured benchmark data -- is exported as the fifth Parquet
-    file without occupying a table of its own.
+    Runs the compiled `aegis-cli.exe` over the 18 shipped fixture entries
+    (13 vulnerable across Python, JavaScript, TypeScript, Rust and Go --
+    including a multi-file split-import pair resolved through sibling imports
+    -- and 5 benign) and the 50 compositional exfiltration chains, runs the
+    real divergence model and the real retriever over the results, measures
+    Rust-vs-Python trained-model parity, validates the SARIF 2.1.0 export,
+    exercises the live `--stdio-wrap` subprocess interception and the
+    hash-chained audit ledger it feeds, model-checks the shipped TLA+
+    specification through `aegis-cli check-tla`, drives the real eBPF
+    three-way equivalence gate (the freestanding C hooks, the Rust simulator,
+    the RFC 9669 VM) over its 24-case table, and folds in the Phase 10
+    verification artefacts: the 1,000-case three-way differential fuzz and the
+    algebraic-properties guard agreement, both read back from the summaries
+    their `cargo test` targets seal rather than re-run here. The measurements
+    go to three formats: DuckDB, Parquet, and a JSON summary. Ten tables are
+    written; the TLA+, eBPF, differential-fuzz, SARIF, stdio-wrap and parity
+    tables get their own Parquet files beside the union one, and the
+    algebraic-properties report -- a fixed three-row suite summary rather than
+    measured benchmark data -- is exported as the last Parquet file without
+    occupying a table of its own.
 
 WHY THE CLI IS INVOKED RATHER THAN REIMPLEMENTED
     The extractor is 2400 lines of Rust with a hop-bounded taint propagation
@@ -123,10 +129,12 @@ EXIT_VIOLATIONS = 1
 #: The decision threshold the gateway applies to a divergence score.
 DIVERGENCE_THRESHOLD = 0.5
 
-#: Thresholds from ADR-016. Exceeding each one is a benchmark failure, not a
-#: footnote: the whole point of the harness is that the claims are falsifiable.
+#: Thresholds from ADR-016, completed by the Phase 10 recall expansion: 13
+#: vulnerable fixtures across five languages plus the multi-file split pair.
+#: Exceeding each one is a benchmark failure, not a footnote: the whole point
+#: of the harness is that the claims are falsifiable.
 THRESHOLDS = {
-    "min_recall": 9,
+    "min_recall": 13,
     "max_false_positives": 0,
     "min_compression_ratio": 0.80,
     "min_hybrid_ndcg": 0.60,
@@ -137,6 +145,25 @@ THRESHOLDS = {
     "min_fuzz_cases": 1000,
     "min_guard_agreements": 200,
 }
+
+#: The Rust↔Python trained-model parity bound for Phase 10 (ADR-024): the two
+#: inferences must agree to within this absolute difference across every
+#: fixture and every synthetic probe vector.
+PARITY_MAX_ABS_DIFF = 1e-6
+#: How many synthetic feature probes supplement the fixture-derived inputs.
+PARITY_SYNTHETIC_PROBES = 100
+
+#: The multi-file split-import pair. The helper module holds the sink chain
+#: but registers no tool of its own, so it is deliberately NOT enumerated as a
+#: standalone fixture (that would be a tool-less graph the compression stage
+#: refuses to emit); the pair is measured through its importer, whose scan
+#: resolves the sibling and reaches the helper's sinks across the file
+#: boundary.
+MULTIFILE_HELPERS = {"py_multifile_helper_sink.py"}
+
+#: The fixture suffixes the static suite scans, one `aegis-cli scan --json`
+#: invocation each.
+FIXTURE_SUFFIXES = {".py", ".js", ".ts", ".rs", ".go"}
 
 
 def find_cli() -> Path:
@@ -181,6 +208,10 @@ class StaticRow:
     dependency_count: int
     dtg_sha256: str
     scan_ms: float
+    #: True when at least one detected sink's provenance names a file OTHER
+    #: than the scanned fixture itself -- the multi-file split-import pair
+    #: reaching its helper module across the file boundary.
+    cross_file: bool = False
 
 
 @dataclass
@@ -363,7 +394,11 @@ def run_static_suite() -> list[StaticRow]:
     """
     rows: list[StaticRow] = []
     for path in sorted(LAB_DIR.iterdir()):
-        if path.suffix not in {".py", ".js", ".ts", ".rs"}:
+        if path.suffix not in FIXTURE_SUFFIXES:
+            continue
+        if path.name in MULTIFILE_HELPERS:
+            # The split-import pair's second file: covered through its
+            # importer's scan below, not as a tool-less standalone fixture.
             continue
         server, scan_ms = scan_fixture(path)
         signals = []
@@ -373,6 +408,15 @@ def run_static_suite() -> list[StaticRow]:
             signals.append("injection_marker")
         if server["has_egress_literal"]:
             signals.append("egress_literal")
+        # Cross-file: a sink whose provenance names a file other than the
+        # scanned fixture is only possible when an imported sibling joined the
+        # symbol graph, which is exactly the Phase 10 capability the split
+        # pair measures.
+        scanned_name = path.name
+        cross_file = any(
+            sink['file_path'] not in (scanned_name, server['server_id'])
+            for sink in server['dtg']['detected_sinks']
+        )
         rows.append(
             StaticRow(
                 fixture=path.name,
@@ -394,6 +438,7 @@ def run_static_suite() -> list[StaticRow]:
                 dependency_count=len(server["dependencies"]),
                 dtg_sha256=server["dtg_sha256"],
                 scan_ms=round(scan_ms, 4),
+                cross_file=cross_file,
             )
         )
     return rows
@@ -1133,6 +1178,8 @@ def summarise(
             "recall_percent": round(100.0 * recall / max(1, len(vulnerable)), 2),
             "false_positive_count": false_positives,
             "false_positive_percent": round(100.0 * false_positives / max(1, len(benign)), 2),
+            "cross_file_fixtures": sum(1 for r in static_rows if r.cross_file),
+            "languages": sorted({r.language for r in static_rows}),
             "min_compression_ratio": round(
                 min((r.compression_ratio for r in static_rows), default=0.0), 6
             ),

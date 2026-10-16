@@ -137,14 +137,18 @@ def index(chunks: list):
     built = HybridCodeGraphIndex(prefer_bge=False)
     for chunk in chunks:
         built.add_chunk(chunk)
-    # Chained within each file: one helper can reach the next, which is what
-    # the propagation term is supposed to exploit.
-    by_server: dict[str, list[str]] = {}
+    # Chained within each file, in source order: one helper can reach the next,
+    # which is what the propagation term is supposed to exploit. The chunker's
+    # return order is not guaranteed to be source order, and a chain built on
+    # it links functions the wrong way round, which lets an unsuspicious chunk
+    # inherit a forward neighbour's hotness and surface in unrelated queries.
+    by_server: dict[str, list] = {}
     for chunk in chunks:
-        by_server.setdefault(chunk.server_id, []).append(chunk.chunk_id)
-    for ids in by_server.values():
-        for earlier, later in zip(ids, ids[1:]):
-            built.link(earlier, later, 0.75)
+        by_server.setdefault(chunk.server_id, []).append(chunk)
+    for file_chunks in by_server.values():
+        ordered = sorted(file_chunks, key=lambda chunk: (chunk.start_line, chunk.chunk_id))
+        for earlier, later in zip(ordered, ordered[1:]):
+            built.link(earlier.chunk_id, later.chunk_id, 0.75)
     built.build()
     return built
 

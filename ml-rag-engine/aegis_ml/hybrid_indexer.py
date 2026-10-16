@@ -418,12 +418,26 @@ class DtgGraph:
 def propagate(
     base_scores: dict[str, float],
     graph: DtgGraph,
+    dense_affinity: dict[str, float] | None = None,
     gamma: float = PROPAGATION_GAMMA,
     hops: int = PROPAGATION_HOPS,
 ) -> dict[str, float]:
     """Propagate scores along typed DTG edges, out to ``hops``.
 
     ``S_final(u) = S_RRF(u) + sum_{h=1..hops} gamma^h sum_{v in N^h(u)} w(u,v) S_RRF(v)``
+
+    A chunk reachable through a DTG edge inherits some of the hot chunk's
+    relevance: the tool registration matched by the query also returns the
+    helper its data flows into.
+
+    Inheritance is **distribution**, not synthesis: it can spread positive
+    query affinity the receiver already has, never conjure it onto a chunk the
+    query actively ruled out. A receiver whose own dense cosine is <= 0
+    anti-matches the query -- handing it an inherited heatmap ranking would
+    surface arbitrary neighbours of every hot hit, which is how a
+    `write_note` tool once rode an env-read predecessor into an env query's
+    top five. If no affinity map is supplied (offline callers that scored with
+    something other than cosine), no gate applies.
 
     Neighbour scores are taken from the **base** score, not the accumulated one.
     Using accumulated scores would compound along a path and make a three-hop
@@ -434,6 +448,8 @@ def propagate(
         decay = gamma**hop
         for source in list(base_scores):
             for target, weight in graph.neighbours(source):
+                if dense_affinity is not None and dense_affinity.get(target, 0.0) <= 0.0:
+                    continue
                 contribution = decay * weight * base_scores.get(target, 0.0)
                 if contribution:
                     out[target] = out.get(target, 0.0) + contribution
@@ -574,7 +590,11 @@ class HybridCodeGraphIndex:
         # this, because both branches rank the same documents highly.
         reranked = self._rerank(query, rrf, dense, sparse)
 
-        propagated = propagate(reranked, self.graph) if propagate_scores else dict(reranked)
+        propagated = (
+            propagate(reranked, self.graph, dense_affinity=dense)
+            if propagate_scores
+            else dict(reranked)
+        )
 
         def build(score_map: dict[str, float], limit: int) -> list[RetrievedChunk]:
             ordered = sorted(score_map.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
@@ -634,13 +654,39 @@ class HybridCodeGraphIndex:
             if query_tokens:
                 score += 0.02 * (overlap / len(query_tokens))
 
-            # (b) intent match against the chunk's measured sinks.
+            # (b) intent match against the chunk's measured sinks. Every
+            # supported language spells these capabilities differently, and a
+            # table that only carried the JavaScript spellings would reward
+            # `process.env` while leaving `std::env::var` -- the exact same
+            # capability -- unrewarded.
             source = meta.get("source_code", text)
-            if wants_exec and ("CommandExec" in source or "child_process" in source):
+            if wants_exec and (
+                "CommandExec" in source
+                or "child_process" in source
+                or "subprocess" in source
+                or "Popen" in source
+                or "exec.Command" in source
+                or "Command::new" in source
+            ):
                 score += 0.05
-            if wants_net and ("NetworkOutbound" in source or "fetch(" in source or "request(" in source):
+            if wants_net and (
+                "NetworkOutbound" in source
+                or "fetch(" in source
+                or "request(" in source
+                or "urlopen" in source
+                or "net.Dial" in source
+                or "TcpStream" in source
+                or "http.Get" in source
+            ):
                 score += 0.05
-            if wants_env and ("process.env" in source or "os.environ" in source or ".env" in source):
+            if wants_env and (
+                "process.env" in source
+                or "os.environ" in source
+                or ".env" in source
+                or "env::var" in source
+                or "Getenv" in source
+                or "LookupEnv" in source
+            ):
                 score += 0.05
             if wants_file and ("FileRead" in source or "readFile" in source or "open(" in source):
                 score += 0.03

@@ -26,7 +26,7 @@ use aegis_common::crypto::{canonical_dtg_hash, AegisSigningKey};
 use aegis_common::tacr::{CompositionPolicy, GrantedCapabilities, TacrContract};
 use aegis_common::types::{CompressedDtg, SinkKind, MAX_HOP_DEPTH};
 use aegis_common::{SecurityLattice, AEGIS_PRODUCT, AEGIS_VERSION};
-use aegis_dtg_parser::{collect_source_files, extract_source, scan_repository};
+use aegis_dtg_parser::{collect_source_files, scan_repository};
 use aegis_smt_verifier::tla_model_checker::{
     run_model_check, GuardMode, MutationKind, SearchLimits, TlaModel,
 };
@@ -85,6 +85,16 @@ pub enum Command {
     },
     /// The benchmark harness.
     Benchmark { suite: String },
+    /// ADR-024: score the exported divergence weights in pure Rust over the
+    /// parity case document, and report the drift against onnxruntime.
+    Parity { manifest: PathBuf, inputs: PathBuf },
+    /// The verification report as a SARIF 2.1.0 log, for the analyst's
+    /// existing static-analysis tooling.
+    Sarif {
+        repo: PathBuf,
+        /// Write the document to a file instead of stdout.
+        out: Option<PathBuf>,
+    },
     /// All four stages.
     AuditAndEnforce { repo: PathBuf },
     /// Print the version.
@@ -173,6 +183,20 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
                 .unwrap_or_else(|| "all".to_string());
             Ok(Command::Benchmark { suite })
         }
+        "parity" => {
+            let rest: Vec<String> = iter.cloned().collect();
+            Ok(Command::Parity {
+                manifest: PathBuf::from(require_flag(&rest, "--manifest")?),
+                inputs: PathBuf::from(require_flag(&rest, "--inputs")?),
+            })
+        }
+        "sarif" => {
+            let rest: Vec<String> = iter.cloned().collect();
+            Ok(Command::Sarif {
+                repo: PathBuf::from(require_flag(&rest, "--repo")?),
+                out: value_of(&rest, "--out").map(PathBuf::from),
+            })
+        }
         "audit-and-enforce" => {
             let repo = flag_value(&mut iter, "--repo")?;
             Ok(Command::AuditAndEnforce { repo })
@@ -240,7 +264,10 @@ pub fn usage() -> String {
              verify --config <FILE> [--smt]  Stage 3: compositional verification\n    \
              check-tla --spec <F> --config <F> [--mode <M>] [--mutation <ID>]\n    \
                                               Stage 4: native TLA+ model check\n    \
+             parity --manifest <F> --inputs <F>\n    \
+                                              ADR-024: Rust/Python model parity\n    \
              benchmark [all]                 Run the benchmark harness\n    \
+             sarif --repo <DIR> [--out <FILE>]  Stage 3 findings as SARIF 2.1.0 log\n    \
              audit-and-enforce --repo <DIR>  All four stages, end to end\n    \
              version | help\n\
          \n\
@@ -310,10 +337,24 @@ pub fn run(command: Command) -> i32 {
             }
         },
         Command::Benchmark { suite } => cmd_benchmark(&suite),
+        Command::Parity { manifest, inputs } => match cmd_parity(&manifest, &inputs) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("parity failed: {e}");
+                EXIT_VIOLATIONS
+            }
+        },
         Command::AuditAndEnforce { repo } => match cmd_audit_and_enforce(&repo) {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("audit-and-enforce failed: {e}");
+                EXIT_VIOLATIONS
+            }
+        },
+        Command::Sarif { repo, out } => match cmd_sarif(&repo, out.as_deref()) {
+            Ok(()) => EXIT_OK,
+            Err(e) => {
+                eprintln!("sarif failed: {e}");
                 EXIT_VIOLATIONS
             }
         },
@@ -368,16 +409,20 @@ pub fn scan_graphs(path: &Path) -> Result<Vec<CompressedDtg>, String> {
         })?;
         let source = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let unit = extract_source(
+        // A single file whose imports name sibling modules in the same
+        // directory is a *server spread over files*: the merged DTG must
+        // include those siblings, or the multi-file tool-to-sink hop is
+        // invisible to a per-file scan.
+        let units = aegis_dtg_parser::extract_entry_with_imports(
             &path.display().to_string(),
-            &path.display().to_string(),
+            path,
             language,
             &source,
         )
         .map_err(|e| e.to_string())?;
         let (dtg, reports) = aegis_dtg_parser::build_server_dtg(
             &path.display().to_string(),
-            std::slice::from_ref(&unit),
+            &units,
         )
         .map_err(|e| e.to_string())?;
         let _ = reports;
@@ -1101,6 +1146,146 @@ fn cmd_check_tla(
 }
 
 // ---------------------------------------------------------------------------
+// parity
+// ---------------------------------------------------------------------------
+
+/// ADR-024: the Rust↔Python model-parity gate.
+///
+/// Loads the exported weight manifest and the parity case document, re-runs
+/// every case through the pure-Rust evaluator, and prints one JSON report.
+/// Exit 0 requires every case inside 1e-6 of onnxruntime's score; any drift
+/// names its case so the retrain that caused it is findable.
+fn cmd_parity(manifest: &Path, inputs: &Path) -> Result<i32, String> {
+    use aegis_common::onnx_parity_scorer::run_parity_check;
+
+    let parity_bound: f64 = 1e-6;
+    let manifest_bytes = std::fs::read(manifest)
+        .map_err(|e| format!("cannot read manifest {}: {e}", manifest.display()))?;
+    let inputs_bytes = std::fs::read(inputs)
+        .map_err(|e| format!("cannot read parity cases {}: {e}", inputs.display()))?;
+    let (weights, report) = run_parity_check(&manifest_bytes, &inputs_bytes)?;
+    // The gate is bound twice over: the pinned-score drift (Rust evaluator vs
+    // onnxruntime on identical inputs) and the derived-feature drift (the
+    // native featurization vs the Python pipeline over the raw graphs). One
+    // number past either bound fails the gate — an evaluator that is exact on
+    // *wrong* inputs is exactly the failure this second bound exists to catch.
+    let within_bound = report.max_abs_diff < parity_bound
+        && (report.derived_cases == 0 || {
+            report.derived_feature_diff < parity_bound
+                && report.derived_adjacency_diff < parity_bound
+                && report.derived_tabular_diff < parity_bound
+                && report.derived_score_diff < parity_bound
+        });
+
+    let document = serde_json::json!({
+        "schema": "aegis.parity_report.v1",
+        "author": "Pratham Kapoor <prathamkapoor027@gmail.com>",
+        "product": AEGIS_PRODUCT,
+        "manifest_model_sha256": weights.model_sha256,
+        "case_count": report.case_count,
+        "fixture_cases": report.fixture_cases,
+        "synthetic_probes": report.synthetic_probes,
+        "bound": parity_bound,
+        "max_abs_diff": report.max_abs_diff,
+        "mean_abs_diff": report.mean_abs_diff,
+        "worst_case": report.worst_case,
+        "derived_cases": report.derived_cases,
+        "derived_feature_diff": report.derived_feature_diff,
+        "derived_feature_slot": serde_json::json!([report.derived_feature_slot.0, report.derived_feature_slot.1]),
+        "derived_adjacency_diff": report.derived_adjacency_diff,
+        "derived_tabular_diff": report.derived_tabular_diff,
+        "derived_tabular_slot": report.derived_tabular_slot,
+        "derived_score_diff": report.derived_score_diff,
+        "derived_worst_case": report.derived_worst_case,
+        "within_bound": within_bound,
+        "failures": report
+            .failures
+            .iter()
+            .map(|(case_id, rust, expected, diff)| {
+                serde_json::json!({
+                    "case_id": case_id,
+                    "rust_score": rust,
+                    "expected_score": expected,
+                    "abs_diff": diff,
+                })
+            })
+            .collect::<Vec<_>>(),
+        "derived_failures": report
+            .derived_failures
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "case_id": f.case_id,
+                    "feature_diff": f.feature_diff,
+                    "adjacency_diff": f.adjacency_diff,
+                    "tabular_diff": f.tabular_diff,
+                    "score_diff": f.score_diff,
+                })
+            })
+            .collect::<Vec<_>>(),
+    });
+    println!("{document:#}");
+
+    if within_bound {
+        Ok(EXIT_OK)
+    } else {
+        let worst = if report.max_abs_diff >= parity_bound {
+            format!("pin {} at {:.3e}", report.worst_case, report.max_abs_diff)
+        } else {
+            format!(
+                "derived drift (features {:.3e}, tabular {:.3e}, score {:.3e}, worst {})",
+                report.derived_feature_diff,
+                report.derived_tabular_diff,
+                report.derived_score_diff,
+                report.derived_worst_case
+            )
+        };
+        Err(format!("{} drift past {parity_bound}: {}", report.failures.len(), worst))
+    }
+}
+
+fn cmd_sarif(repo: &std::path::Path, out_path: Option<&std::path::Path>) -> Result<(), String> {
+    use aegis_common::sarif::{build_sarif_log, SarifBuild, SarifFinding, SarifRuleSpec};
+    let audit = audit_and_enforce(repo)?;
+    let rules: Vec<aegis_common::sarif::SarifRuleSpec> = [
+        ("Property 1: Tool Integrity", "A tool executes only the bytes its attestation hashed."),
+        ("Property 2: Data Confinement", "Data never crosses a lattice boundary without release."),
+        ("Property 3: Privilege Boundedness", "Every grant follows from the attested capability table."),
+        ("Property 4: Context Isolation", "One session's context cannot enter another session's call."),
+    ]
+    .iter()
+    .map(|(property, description)| SarifRuleSpec::from_property(property, description).expect("modelled property"))
+    .collect();
+    let findings = audit
+        .verification
+        .violations
+        .iter()
+        .map(|v| SarifFinding {
+            rule_id: format!("AEGIS-{}", v.property.replace(':', "-")),
+            level: "error".to_string(),
+            message: v.trace.summary(),
+            logical_locations: v.chain.iter().cloned().collect(),
+        })
+        .collect();
+    let build = SarifBuild {
+        driver_name: aegis_common::AEGIS_PRODUCT.to_string(),
+        driver_version: aegis_common::AEGIS_VERSION.to_string(),
+        rules,
+        findings,
+    };
+    let log = build_sarif_log(&build)?;
+    let document = aegis_common::sarif::to_pretty_json(&log)
+        .map_err(|e| format!("SARIF serialisation failed: {e}"))?;
+    if let Some(path) = out_path {
+        std::fs::write(path, document)
+            .map_err(|e| format!("cannot write SARIF to {}: {e}", path.display()))?;
+    } else {
+        println!("{document}");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // benchmark
 // ---------------------------------------------------------------------------
 
@@ -1218,6 +1403,13 @@ mod tests {
                 repo: PathBuf::from(".")
             }
         );
+        assert_eq!(
+            parse_args(&args(&["parity", "--manifest", "w.json", "--inputs", "c.json"])).unwrap(),
+            Command::Parity {
+                manifest: PathBuf::from("w.json"),
+                inputs: PathBuf::from("c.json")
+            }
+        );
     }
 
     #[test]
@@ -1225,12 +1417,99 @@ mod tests {
         assert!(parse_args(&args(&["scan"])).is_err());
         assert!(parse_args(&args(&["scan", "--path"])).is_err());
         assert!(parse_args(&args(&["verify"])).is_err());
+        assert!(parse_args(&args(&["parity", "--manifest", "w.json"])).is_err());
     }
 
     #[test]
     fn unknown_subcommands_are_rejected() {
         let err = parse_args(&args(&["rm", "-rf"])).unwrap_err();
         assert!(err.contains("unknown subcommand"));
+    }
+
+    /// A one-head, one-tree weight manifest whose GAT and GBDT arithmetic is
+    /// small enough to score by hand: the entry projection lands below 0.5,
+    /// the split on fused feature 4 (the first tabular slot) reads low, and
+    /// the score is `sigmoid(0.12)`.
+    fn parity_fixture_bytes() -> (String, String) {
+        let manifest = r#"{
+            "schema": "aegis.divergence_weights.v1",
+            "model_sha256": "test-vector-only",
+            "n_heads": 1,
+            "hidden_dim": 2,
+            "out_dim": 4,
+            "in_dim": 3,
+            "alpha_slope": 0.2,
+            "W": [[[0.5, -0.25], [1.0, 2.0], [-1.5, 0.75]]],
+            "a_src": [[0.25, -0.5]],
+            "a_dst": [[-0.125, 0.875]],
+            "W_out": [[1.0, 2.0, 3.0, 4.0], [-1.0, 0.5, -0.25, 0.125]],
+            "learning_rate": 0.12,
+            "base_log_odds": 0.0,
+            "n_estimators": 1,
+            "trees": [{
+                "feature": [4, -1, -1],
+                "threshold": [0.5, 0.0, 0.0],
+                "children_left": [1, -1, -1],
+                "children_right": [2, -1, -1],
+                "value": [0.0, 1.0, 2.0]
+            }]
+        }"#;
+        let inputs = r#"{
+            "schema": "aegis.parity_inputs.v1",
+            "cases": [
+                {
+                    "kind": "fixture",
+                    "case_id": "cli_parity_case",
+                    "node_features": [[1.0, 0.0, 2.0]],
+                    "adjacency": [[1.0]],
+                    "tabular": [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    "expected_score": 0.5299640518917284
+                }
+            ]
+        }"#;
+        (manifest.to_string(), inputs.to_string())
+    }
+
+    #[test]
+    fn parity_reports_within_bound_when_engines_agree() {
+        let (manifest, inputs) = parity_fixture_bytes();
+        let tmp = std::env::temp_dir().join(format!("aegis-parity-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let manifest_path = tmp.join("weights.json");
+        let inputs_path = tmp.join("cases.json");
+        std::fs::write(&manifest_path, manifest).unwrap();
+        std::fs::write(&inputs_path, inputs).unwrap();
+
+        let code = run(Command::Parity {
+            manifest: manifest_path.clone(),
+            inputs: inputs_path.clone(),
+        });
+        assert_eq!(code, EXIT_OK, "the hand-scored case must sit inside 1e-6");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn parity_flags_a_drifted_case_as_violation() {
+        let (manifest, inputs) = parity_fixture_bytes();
+        // onnxruntime answering 0.8 while Rust scores ~0.53: past the bound.
+        let drifted = inputs.replace("0.5299640518917284", "0.8");
+        let tmp = std::env::temp_dir().join(format!("aegis-parity-drift-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let manifest_path = tmp.join("weights.json");
+        let inputs_path = tmp.join("cases.json");
+        std::fs::write(&manifest_path, manifest).unwrap();
+        std::fs::write(&inputs_path, drifted).unwrap();
+
+        let code = run(Command::Parity {
+            manifest: manifest_path.clone(),
+            inputs: inputs_path.clone(),
+        });
+        assert_eq!(code, EXIT_VIOLATIONS, "drift past 1e-6 is a failing gate");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
